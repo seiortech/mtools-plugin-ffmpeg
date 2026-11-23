@@ -171,6 +171,7 @@ func BuildTimelineNode(
 	stripAsset string,
 	chapters []engine.ChapterInfo,
 	clips []engine.ClipSegment,
+	includeClips bool,
 	disabled bool,
 ) pluginapi.UINode {
 	if trackW < 220 {
@@ -193,6 +194,7 @@ func BuildTimelineNode(
 		ops = append(ops, pluginapi.UICanvasOp{
 			Kind: "image",
 			Src:  "asset:" + stripAsset,
+			Fit:  "fill",
 			X:    0,
 			Y:    0,
 			W:    float64(trackW),
@@ -209,18 +211,20 @@ func BuildTimelineNode(
 		})
 	}
 
-	for _, cl := range clips {
-		cx1 := TimeToX(cl.StartSec, duration, trackW)
-		cx2 := TimeToX(cl.EndSec, duration, trackW)
-		if cx2 > cx1+2 {
-			ops = append(ops, pluginapi.UICanvasOp{
-				Kind:  "rect",
-				Token: "blue_ink",
-				X:     cx1,
-				Y:     0,
-				W:     cx2 - cx1,
-				H:     5,
-			})
+	if includeClips {
+		for _, cl := range clips {
+			cx1 := TimeToX(cl.StartSec, duration, trackW)
+			cx2 := TimeToX(cl.EndSec, duration, trackW)
+			if cx2 > cx1+2 {
+				ops = append(ops, pluginapi.UICanvasOp{
+					Kind:  "rect",
+					Token: "blue_ink",
+					X:     cx1,
+					Y:     0,
+					W:     cx2 - cx1,
+					H:     5,
+				})
+			}
 		}
 	}
 
@@ -269,6 +273,12 @@ func BuildTimelineNode(
 	leftHandleX := math.Min(math.Max(startX-float64(HandleWidth)/2, 0), float64(trackW-HandleWidth))
 	rightHandleX := math.Min(math.Max(endX-float64(HandleWidth)/2, 0), float64(trackW-HandleWidth))
 
+	var bindMin, bindMax float64
+	if duration > 0 && endSec > startSec {
+		bindMin = startSec
+		bindMax = endSec
+	}
+
 	stackChildren := []pluginapi.UINode{
 		{
 			ID:   "trim_canvas",
@@ -276,11 +286,14 @@ func BuildTimelineNode(
 			Props: mustProps(pluginapi.UICanvasProps{
 				Width:         trackW,
 				Height:        TimelineHeight,
+				Surface:       "ground",
 				BorderWidth:   0,
 				Clickable:     !disabled && duration > 0,
 				BindVideo:     "video_player",
 				BindDuration:  duration,
 				BindPos:       playheadSec,
+				BindMin:       bindMin,
+				BindMax:       bindMax,
 				PlayheadWidth: 4,
 				Ops:           ops,
 			}),
@@ -380,6 +393,51 @@ func BuildTimelineNode(
 			Padding:     0,
 		}),
 		Children: []pluginapi.UINode{stack},
+	}
+}
+
+// BuildPlaybackBarNode constructs a compact 16 DIP full-duration seek scrubber for non-trim modes.
+func BuildPlaybackBarNode(trackW int, duration, playheadSec float64, disabled bool) pluginapi.UINode {
+	if trackW < 220 {
+		trackW = 220
+	}
+	const barH = 16
+	ops := []pluginapi.UICanvasOp{
+		{
+			Kind:  "rect",
+			Token: "field_support",
+			X:     0,
+			Y:     (barH - 4) / 2,
+			W:     float64(trackW),
+			H:     4,
+		},
+	}
+	canvas := pluginapi.UINode{
+		ID:   "playback_canvas",
+		Kind: pluginapi.UINodeCanvas,
+		Props: mustProps(pluginapi.UICanvasProps{
+			Width:         trackW,
+			Height:        barH,
+			Surface:       "ground",
+			BorderWidth:   0,
+			Clickable:     !disabled && duration > 0,
+			BindVideo:     "video_player",
+			BindDuration:  duration,
+			BindPos:       playheadSec,
+			PlayheadWidth: 4,
+			Ops:           ops,
+		}),
+	}
+	return pluginapi.UINode{
+		ID:   "trim_frame",
+		Kind: pluginapi.UINodeColumn,
+		Props: mustProps(pluginapi.UIContainerProps{
+			NoFillWidth: true,
+			BorderSize:  2,
+			BorderToken: "ink",
+			Padding:     0,
+		}),
+		Children: []pluginapi.UINode{canvas},
 	}
 }
 

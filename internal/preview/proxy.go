@@ -42,19 +42,36 @@ func NeedsPreviewProxy(probe *engine.MediaProbe) bool {
 	return false
 }
 
+// MaxRemuxProxyBytes caps stream-copy remux proxies safely below the host's
+// 256 MiB Live UI video asset limit so container overhead stays within bounds.
+const MaxRemuxProxyBytes int64 = 240 << 20
+
+// CanFastRemuxProxy reports whether probe can be remuxed (or audio-only transcoded)
+// without a full video re-encode and within the host's 256 MiB video asset cap.
+func CanFastRemuxProxy(probe *engine.MediaProbe) bool {
+	if probe == nil || probe.SizeBytes > MaxRemuxProxyBytes {
+		return false
+	}
+	if !probe.HasVideo() {
+		return true
+	}
+	vc := strings.ToLower(probe.VideoStreams[0].Codec)
+	return vc == "h264" || vc == "avc" || vc == "avc1" || ((vc == "hevc" || vc == "h265" || vc == "hev1" || vc == "hvc1") && runtime.GOOS != "linux")
+}
+
 // BuildProxyArgs returns deterministic FFmpeg arguments to create a playable MP4/M4A proxy.
 func BuildProxyArgs(filePath string, probe *engine.MediaProbe, outPath string) []string {
 	args := []string{"-nostdin", "-y", "-hide_banner", "-i", filePath}
 
 	if probe != nil && !probe.HasVideo() {
-		return append(args, "-vn", "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", outPath)
+		return append(args, "-vn", "-c:a", "aac", "-b:a", "160k", outPath)
 	}
 
 	canCopyVideo := false
 	canCopyAudio := true
-	if probe != nil && probe.HasVideo() {
+	if probe != nil && probe.HasVideo() && probe.SizeBytes <= MaxRemuxProxyBytes {
 		vc := strings.ToLower(probe.VideoStreams[0].Codec)
-		if vc == "h264" || vc == "avc" || ((vc == "hevc" || vc == "h265") && runtime.GOOS != "linux") {
+		if vc == "h264" || vc == "avc" || vc == "avc1" || ((vc == "hevc" || vc == "h265" || vc == "hev1" || vc == "hvc1") && runtime.GOOS != "linux") {
 			canCopyVideo = true
 		}
 	}
@@ -66,10 +83,10 @@ func BuildProxyArgs(filePath string, probe *engine.MediaProbe, outPath string) [
 	}
 
 	if canCopyVideo && canCopyAudio {
-		return append(args, "-map", "0:v:0", "-map", "0:a:0?", "-c", "copy", "-movflags", "+faststart", outPath)
+		return append(args, "-map", "0:v:0", "-map", "0:a:0?", "-c", "copy", outPath)
 	}
 	if canCopyVideo && !canCopyAudio {
-		return append(args, "-map", "0:v:0", "-map", "0:a:0?", "-c:v", "copy", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", outPath)
+		return append(args, "-map", "0:v:0", "-map", "0:a:0?", "-c:v", "copy", "-c:a", "aac", "-b:a", "128k", outPath)
 	}
 
 	return append(args,
@@ -79,41 +96,72 @@ func BuildProxyArgs(filePath string, probe *engine.MediaProbe, outPath string) [
 		"-c:v", "libx264",
 		"-preset", "ultrafast",
 		"-crf", "30",
-		"-threads", "2",
+		"-threads", "4",
 		"-pix_fmt", "yuv420p",
 		"-c:a", "aac",
 		"-b:a", "128k",
-		"-movflags", "+faststart",
 		outPath,
 	)
 }
 
 // BuildHardwareProxyArgs returns macOS VideoToolbox 480p arguments when full video transcoding is needed.
 func BuildHardwareProxyArgs(filePath string, probe *engine.MediaProbe, outPath string) ([]string, bool) {
-	if runtime.GOOS != "darwin" || probe == nil || !probe.HasVideo() {
+	if runtime.GOOS != "darwin" {
 		return nil, false
 	}
-	vc := strings.ToLower(probe.VideoStreams[0].Codec)
-	if vc == "h264" || vc == "avc" || vc == "hevc" || vc == "h265" {
+	return BuildHardwareProxyArgsWithHW(filePath, probe, engine.HWPlan{
+		Mode:        engine.HWAccelAuto,
+		Backend:     engine.HWBackendVideoToolbox,
+		H264Encoder: "h264_videotoolbox",
+	}, outPath)
+}
+
+// BuildHardwareProxyArgsWithHW builds hardware-decoded and/or hardware-encoded 480p proxy arguments.
+func BuildHardwareProxyArgsWithHW(filePath string, probe *engine.MediaProbe, hw engine.HWPlan, outPath string) ([]string, bool) {
+	if probe == nil || !probe.HasVideo() || CanFastRemuxProxy(probe) || hw.Mode == engine.HWAccelOff {
 		return nil, false
 	}
-	return []string{
-		"-nostdin", "-y", "-hide_banner", "-i", filePath,
-		"-map", "0:v:0",
-		"-map", "0:a:0?",
-		"-vf", "scale=-2:min(ih\\,480)",
-		"-c:v", "h264_videotoolbox",
-		"-b:v", "1500k",
-		"-pix_fmt", "yuv420p",
-		"-c:a", "aac",
-		"-b:a", "128k",
-		"-movflags", "+faststart",
-		outPath,
-	}, true
+	hwPrefix := engine.DecodeInputPrefix(hw)
+	hasEnc := hw.Mode == engine.HWAccelAuto && hw.H264Encoder != ""
+	if len(hwPrefix) == 0 && !hasEnc {
+		return nil, false
+	}
+
+	args := []string{"-nostdin", "-y", "-hide_banner"}
+	args = append(args, hwPrefix...)
+	args = append(args, "-i", filePath, "-map", "0:v:0", "-map", "0:a:0?")
+	if hasEnc {
+		args = engine.AppendVideoEncoderArgs(args, hw.H264Encoder, "mp4", 26, "ultrafast", 480, 1500, 0, 0, hw)
+	} else {
+		args = append(args,
+			"-vf", "scale=-2:min(ih\\,480)",
+			"-c:v", "libx264",
+			"-preset", "ultrafast",
+			"-crf", "30",
+			"-threads", "4",
+			"-pix_fmt", "yuv420p",
+		)
+	}
+	args = append(args, "-c:a", "aac", "-b:a", "128k", outPath)
+	return args, true
 }
 
 // BuildPlayableProxy creates a temporary playable MP4 proxy atomically at outPath.
 func BuildPlayableProxy(ctx context.Context, ffmpegBin, filePath string, probe *engine.MediaProbe, outPath string) error {
+	var hw engine.HWPlan
+	if runtime.GOOS == "darwin" {
+		hw = engine.HWPlan{
+			Mode:        engine.HWAccelAuto,
+			Backend:     engine.HWBackendVideoToolbox,
+			H264Encoder: "h264_videotoolbox",
+		}
+	}
+	return BuildPlayableProxyWithHW(ctx, ffmpegBin, filePath, probe, hw, outPath)
+}
+
+// BuildPlayableProxyWithHW creates a temporary playable MP4 proxy atomically at outPath,
+// trying hardware acceleration when configured and falling back to CPU on failure.
+func BuildPlayableProxyWithHW(ctx context.Context, ffmpegBin, filePath string, probe *engine.MediaProbe, hw engine.HWPlan, outPath string) error {
 	if strings.TrimSpace(ffmpegBin) == "" {
 		return errors.New("ffmpeg executable is missing")
 	}
@@ -124,7 +172,7 @@ func BuildPlayableProxy(ctx context.Context, ffmpegBin, filePath string, probe *
 	defer cancel()
 
 	tmp := outPath + ".tmp.mp4"
-	if hwArgs, ok := BuildHardwareProxyArgs(filePath, probe, tmp); ok {
+	if hwArgs, ok := BuildHardwareProxyArgsWithHW(filePath, probe, hw, tmp); ok {
 		if err := exec.CommandContext(pctx, ffmpegBin, hwArgs...).Run(); err == nil {
 			return os.Rename(tmp, outPath)
 		}

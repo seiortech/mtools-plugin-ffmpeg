@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -20,12 +22,124 @@ import (
 const (
 	binaryCacheTTL = 5 * time.Second
 	renderMinGap   = 80 * time.Millisecond
+
+	VideoPreviewTrimOnly = "trim_only"
+	VideoPreviewAuto     = "auto"
+	VideoPreviewManual   = "manual"
+	VideoPreviewOff      = "off"
+
+	ProxyPolicyRemuxOnly = "remux_only"
+	ProxyPolicyAuto      = "auto"
+	ProxyPolicyManual    = "manual"
+	ProxyPolicyOff       = "off"
 )
+
+func normalizeVideoPreviewMode(v string) string {
+	switch strings.TrimSpace(v) {
+	case VideoPreviewTrimOnly, VideoPreviewManual, VideoPreviewOff:
+		return strings.TrimSpace(v)
+	default:
+		return VideoPreviewAuto
+	}
+}
+
+func normalizeProxyPolicy(v string) string {
+	switch strings.TrimSpace(v) {
+	case ProxyPolicyRemuxOnly, ProxyPolicyManual, ProxyPolicyOff:
+		return strings.TrimSpace(v)
+	default:
+		return ProxyPolicyAuto
+	}
+}
+
+func shouldAutoPreview(videoPreviewMode, mode string) bool {
+	switch normalizeVideoPreviewMode(videoPreviewMode) {
+	case VideoPreviewTrimOnly:
+		return modeUsesTrimRange(mode)
+	case VideoPreviewManual, VideoPreviewOff:
+		return false
+	default:
+		return true
+	}
+}
 
 type cachedBin struct {
 	path      string
 	err       error
 	checkedAt time.Time
+}
+
+type cachedHWCaps struct {
+	ffPath  string
+	caps    engine.HWCapabilities
+	checked bool
+}
+
+type ModeSession struct {
+	InputFiles        []string
+	ActiveFileIdx     int
+	ProbeLoading      bool
+	FilmstripLoading  bool
+	PreviewLoaded     bool
+	ProxyRequired     bool
+	ProxyReason       string
+	ProxyStage        string
+	TryNativeOverride bool
+	LoadingStage      string
+	LoadingFile       string
+	LoadingPct        float64
+	ProbeError        string
+	Probe             *engine.MediaProbe
+	StripAsset        string
+	PosterAsset       string
+	ProxyAsset        string
+	ProxyLoading      bool
+	ProxyTried        bool
+	VideoFit          string // "contain" (default) or "cover"
+
+	PlayheadSec   float64
+	IsPlaying     bool
+	PlayEnded     bool
+	VideoReady    bool
+	VideoErr      string
+	SeekTargetSec float64
+	PlaybackRate  float64
+	Volume        float64
+	Muted         bool
+	LoopSelection bool
+
+	StartSec   float64
+	EndSec     float64
+	StartText  string
+	EndText    string
+	Clips      []engine.ClipSegment
+	NextClipID int
+}
+
+func defaultModeSession() ModeSession {
+	return ModeSession{
+		VideoFit:     "contain",
+		PlaybackRate: 1.0,
+		Volume:       1.0,
+	}
+}
+
+func (ms ModeSession) IsMediaLoading() bool {
+	return ms.ProbeLoading
+}
+
+func (ms ModeSession) EffectiveVideoFit() string {
+	if ms.VideoFit == "cover" {
+		return "cover"
+	}
+	return "contain"
+}
+
+type ModeSessions struct {
+	Convert ModeSession
+	Trim    ModeSession
+	Streams ModeSession
+	Frames  ModeSession
 }
 
 type State struct {
@@ -40,136 +154,187 @@ type State struct {
 	StreamsSubTab    string // "audio", "subtitles", "metadata"
 	RailWidth        float32
 	RailCollapsed    bool
+	DeckCollapsed    bool
 	ShowCmdPreview   bool
 	FullscreenOpen   bool
 
 	// Helpers & settings
-	Settings    map[string]string
-	HasFFmpeg   bool
-	HasFFprobe  bool
-	FFmpegPath  string
-	FFprobePath string
-	OutputDir   string
+	Settings           map[string]string
+	HasFFmpeg          bool
+	HasFFprobe         bool
+	FFmpegPath         string
+	FFprobePath        string
+	OutputDir          string
+	VideoPreviewMode   string
+	TimelineFilmstrip  bool
+	PreviewProxyPolicy string
+	HWAccelMode        string
+	HWBackend          string
+	HWCaps             engine.HWCapabilities
+	HWPlan             engine.HWPlan
 
-	// Input files & probe
-	InputFiles       []string
-	ActiveFileIdx    int
-	ProbeLoading     bool
-	FilmstripLoading bool
-	VideoLoadWaiting bool
-	LoadingStage     string
-	LoadingFile      string
-	LoadingPct       float64
-	ProbeError       string
-	Probe            *engine.MediaProbe
-	StripAsset       string
-	PosterAsset      string
-	ProxyAsset       string
-	ProxyLoading     bool
-	ProxyTried       bool
-	AssetRev         uint64
-	VideoFit         string // "contain" (default) or "cover"
+	// Workspace-wide monotonic media asset & player sequences
+	AssetRev uint64
+	PlaySeq  uint64
+	SeekSeq  uint64
 
-	// Live Video Player & Transport
-	PlayheadSec   float64
-	IsPlaying     bool
-	PlayEnded     bool
-	VideoReady    bool
-	VideoErr      string
-	PlaySeq       uint64
-	SeekSeq       uint64
-	SeekTargetSec float64
-	PlaybackRate  float64
-	Volume        float64
-	Muted         bool
-	LoopSelection bool
-
-	// Trim & Cut List
-	StartSec   float64
-	EndSec     float64
-	StartText  string
-	EndText    string
-	Clips      []engine.ClipSegment
-	NextClipID int
+	// Per-mode separated media, player, and trim sessions
+	Sessions ModeSessions
 
 	// Options
 	ActivePreset string
 	Opts         engine.TranscodeOptions
 
-	// Queue & Status
+	// Shared Queue & Status
 	QueueItems   []queue.Item
 	QueueRunning bool
 	StatusMsg    string
 	ErrorMsg     string
 }
 
+func normalizeMode(mode string) string {
+	switch mode {
+	case engine.ModeTrim, engine.ModeStreams, engine.ModeFrames:
+		return mode
+	default:
+		return engine.ModeConvert
+	}
+}
+
+func modeUsesTrimRange(mode string) bool {
+	return mode == engine.ModeTrim || mode == engine.ModeFrames
+}
+
+func modeUsesClips(mode string) bool {
+	return mode == engine.ModeTrim
+}
+
+func (s *State) SessionFor(mode string) *ModeSession {
+	switch normalizeMode(mode) {
+	case engine.ModeTrim:
+		return &s.Sessions.Trim
+	case engine.ModeStreams:
+		return &s.Sessions.Streams
+	case engine.ModeFrames:
+		return &s.Sessions.Frames
+	default:
+		return &s.Sessions.Convert
+	}
+}
+
+func (s *State) ActiveSession() *ModeSession {
+	return s.SessionFor(s.Mode)
+}
+
+func (s State) CurrentSession() ModeSession {
+	switch normalizeMode(s.Mode) {
+	case engine.ModeTrim:
+		return s.Sessions.Trim
+	case engine.ModeStreams:
+		return s.Sessions.Streams
+	case engine.ModeFrames:
+		return s.Sessions.Frames
+	default:
+		return s.Sessions.Convert
+	}
+}
+
 func (s State) IsMediaLoading() bool {
-	return s.ProbeLoading || s.FilmstripLoading || s.ProxyLoading || s.VideoLoadWaiting
+	return s.CurrentSession().IsMediaLoading()
 }
 
 func (s State) EffectiveVideoFit() string {
-	if s.VideoFit == "cover" {
-		return "cover"
-	}
-	return "contain"
+	return s.CurrentSession().EffectiveVideoFit()
 }
 
 func (s State) buildCurrentJobSpec() (engine.JobSpec, error) {
-	if len(s.InputFiles) == 0 {
+	ms := s.CurrentSession()
+	if len(ms.InputFiles) == 0 {
 		return engine.JobSpec{}, engine.ErrNoInputFiles
 	}
-	idx := s.ActiveFileIdx
-	if idx < 0 || idx >= len(s.InputFiles) {
+	idx := ms.ActiveFileIdx
+	if idx < 0 || idx >= len(ms.InputFiles) {
 		idx = 0
 	}
-	inputs := []string{s.InputFiles[idx]}
-	if s.Mode == engine.ModeTrim && s.Opts.ConcatMode == "concat_files" && len(s.InputFiles) >= 2 {
-		inputs = append([]string(nil), s.InputFiles...)
+	inputs := []string{ms.InputFiles[idx]}
+	if s.Mode == engine.ModeTrim && s.Opts.ConcatMode == "concat_files" && len(ms.InputFiles) >= 2 {
+		inputs = append([]string(nil), ms.InputFiles...)
+	}
+	var startSec, endSec float64
+	var clips []engine.ClipSegment
+	if modeUsesTrimRange(s.Mode) {
+		startSec = ms.StartSec
+		endSec = ms.EndSec
+	}
+	if modeUsesClips(s.Mode) {
+		clips = append([]engine.ClipSegment(nil), ms.Clips...)
 	}
 	return engine.JobSpec{
 		Mode:       s.Mode,
 		InputPaths: inputs,
-		StartSec:   s.StartSec,
-		EndSec:     s.EndSec,
-		Clips:      append([]engine.ClipSegment(nil), s.Clips...),
+		StartSec:   startSec,
+		EndSec:     endSec,
+		Clips:      clips,
 		Opts:       s.Opts,
 		OutputDir:  s.OutputDir,
+		HW:         s.HWPlan,
 	}, nil
+}
+
+type modeLoadCtrl struct {
+	probeSeq    uint64
+	probeCancel context.CancelFunc
+	stripCancel context.CancelFunc
+	proxyCancel context.CancelFunc
 }
 
 type App struct {
 	dataDir string
 
-	mu             sync.Mutex
-	state          State
-	session        *pluginapi.UISession
-	assetsDir      string
-	probeSeq       uint64
-	probeCancel    context.CancelFunc
-	proxyCancel    context.CancelFunc
-	videoWaitTimer *time.Timer
-	lastRender     time.Time
+	mu              sync.Mutex
+	state           State
+	session         *pluginapi.UISession
+	assetsDir       string
+	settingsFile    string
+	settingsModTime time.Time
+	modeWorkers     map[string]*modeLoadCtrl
+	lastRender      time.Time
 
 	queueMgr *queue.Manager
 	ffCache  cachedBin
 	fpCache  cachedBin
+	hwCache  cachedHWCaps
 }
 
 func NewApp(dataDir string) *App {
 	a := &App{
 		dataDir: dataDir,
+		modeWorkers: map[string]*modeLoadCtrl{
+			engine.ModeConvert: {},
+			engine.ModeTrim:    {},
+			engine.ModeStreams: {},
+			engine.ModeFrames:  {},
+		},
 		state: State{
-			ViewportW:        944,
-			ViewportH:        708,
-			ActiveTab:        "inspector",
-			Mode:             engine.ModeConvert,
-			ConvertSubTab:    "presets",
-			ConvertMediaKind: "video",
-			StreamsSubTab:    "audio",
-			RailWidth:        300,
-			VideoFit:         "contain",
-			PlaybackRate:     1.0,
-			Volume:           1.0,
+			ViewportW:          944,
+			ViewportH:          708,
+			ActiveTab:          "inspector",
+			Mode:               engine.ModeConvert,
+			ConvertSubTab:      "presets",
+			ConvertMediaKind:   "video",
+			StreamsSubTab:      "audio",
+			RailWidth:          300,
+			VideoPreviewMode:   VideoPreviewAuto,
+			TimelineFilmstrip:  true,
+			PreviewProxyPolicy: ProxyPolicyAuto,
+			HWAccelMode:        engine.HWAccelAuto,
+			HWBackend:          engine.HWBackendAuto,
+			Sessions: ModeSessions{
+				Convert: defaultModeSession(),
+				Trim:    defaultModeSession(),
+				Streams: defaultModeSession(),
+				Frames:  defaultModeSession(),
+			},
 			Opts: engine.TranscodeOptions{
 				Container:        "mp4",
 				VideoCodec:       "libx264",
@@ -213,6 +378,16 @@ func (a *App) Open(ctx context.Context, params pluginapi.UIOpenParams, session *
 	if params.Viewport.Height > 0 {
 		a.state.ViewportH = params.Viewport.Height
 	}
+	if pDir := strings.TrimSpace(params.Settings[pluginapi.SettingPluginDataDir]); pDir != "" {
+		a.settingsFile = filepath.Join(pDir, "settings.json")
+	} else if a.dataDir != "" {
+		a.settingsFile = filepath.Join(a.dataDir, "settings.json")
+	}
+	if a.settingsFile != "" {
+		if info, err := os.Stat(a.settingsFile); err == nil {
+			a.settingsModTime = info.ModTime()
+		}
+	}
 	a.applySettingsLocked(params.Settings)
 	a.refreshHelpersLocked()
 	tree := RenderTree(a.state)
@@ -220,19 +395,37 @@ func (a *App) Open(ctx context.Context, params pluginapi.UIOpenParams, session *
 	return tree, nil
 }
 
+func (a *App) workerCtrlLocked(mode string) *modeLoadCtrl {
+	m := normalizeMode(mode)
+	if a.modeWorkers == nil {
+		a.modeWorkers = make(map[string]*modeLoadCtrl)
+	}
+	ctrl := a.modeWorkers[m]
+	if ctrl == nil {
+		ctrl = &modeLoadCtrl{}
+		a.modeWorkers[m] = ctrl
+	}
+	return ctrl
+}
+
 func (a *App) Close() {
 	a.mu.Lock()
-	if a.probeCancel != nil {
-		a.probeCancel()
-		a.probeCancel = nil
-	}
-	if a.proxyCancel != nil {
-		a.proxyCancel()
-		a.proxyCancel = nil
-	}
-	if a.videoWaitTimer != nil {
-		a.videoWaitTimer.Stop()
-		a.videoWaitTimer = nil
+	for _, ctrl := range a.modeWorkers {
+		if ctrl == nil {
+			continue
+		}
+		if ctrl.probeCancel != nil {
+			ctrl.probeCancel()
+			ctrl.probeCancel = nil
+		}
+		if ctrl.stripCancel != nil {
+			ctrl.stripCancel()
+			ctrl.stripCancel = nil
+		}
+		if ctrl.proxyCancel != nil {
+			ctrl.proxyCancel()
+			ctrl.proxyCancel = nil
+		}
 	}
 	assetsDir := a.assetsDir
 	a.mu.Unlock()
@@ -247,6 +440,7 @@ func (a *App) InvalidateBinaryCaches() {
 	a.mu.Lock()
 	a.ffCache = cachedBin{}
 	a.fpCache = cachedBin{}
+	a.hwCache = cachedHWCaps{}
 	a.refreshHelpersLocked()
 	a.mu.Unlock()
 	a.syncQueueAndRender(true)
@@ -258,19 +452,32 @@ func (a *App) Event(ctx context.Context, ev pluginapi.UIEvent, session *pluginap
 	if session != nil && a.assetsDir == "" {
 		a.assetsDir = session.AssetsDir()
 	}
+	if ev.Node == "settings" && ev.Kind == pluginapi.UIEventChange {
+		a.reloadSettingsFromDiskLocked(true)
+		a.refreshHelpersLocked()
+		a.reconcileSessionsWithSettingsLocked(ctx)
+		tree := RenderTree(a.state)
+		a.mu.Unlock()
+		a.renderTree(tree, true)
+		return nil
+	}
+	a.reloadSettingsFromDiskLocked(false)
 	a.refreshHelpersLocked()
 	s := &a.state
+	activeMode := normalizeMode(s.Mode)
+	ms := s.SessionFor(activeMode)
+	ctrl := a.workerCtrlLocked(activeMode)
 	forceRender := true
 
 	if ev.Node == "btn_cancel_load" {
-		a.cancelLoadingLocked()
+		a.cancelLoadingLocked(activeMode)
 		tree := RenderTree(a.state)
 		a.mu.Unlock()
 		a.renderTree(tree, true)
 		return nil
 	}
 
-	if s.IsMediaLoading() {
+	if ms.IsMediaLoading() {
 		switch ev.Node {
 		case "root":
 			if ev.Kind == pluginapi.UIEventResize || ev.Kind == pluginapi.UIEventView {
@@ -287,30 +494,6 @@ func (a *App) Event(ctx context.Context, ev pluginapi.UIEvent, session *pluginap
 			if ev.Kind == pluginapi.UIEventResize {
 				if w, err := strconv.Atoi(ev.Value); err == nil && w >= 240 && w <= 560 {
 					s.RailWidth = float32(w)
-				}
-			}
-		case "video_player":
-			if ev.Kind == pluginapi.UIEventMedia {
-				prevPlaying, prevEnded, prevReady, prevErr := s.IsPlaying, s.PlayEnded, s.VideoReady, s.VideoErr
-				applyMediaTelemetry(s, ev.Value)
-				if s.VideoReady || s.VideoErr != "" {
-					s.VideoLoadWaiting = false
-					if a.videoWaitTimer != nil {
-						a.videoWaitTimer.Stop()
-						a.videoWaitTimer = nil
-					}
-					a.updateLoadingStageLocked()
-				}
-				stateChanged := s.IsPlaying != prevPlaying || s.PlayEnded != prevEnded || s.VideoReady != prevReady || s.VideoErr != prevErr
-				if s.VideoErr != "" && !s.ProxyTried && s.HasFFmpeg && s.Probe != nil {
-					a.startProxyBuildLocked(ctx, a.probeSeq, s.Probe)
-					stateChanged = true
-				}
-				if stateChanged || !s.IsMediaLoading() {
-					tree := RenderTree(a.state)
-					a.mu.Unlock()
-					a.renderTree(tree, true)
-					return nil
 				}
 			}
 		}
@@ -343,10 +526,12 @@ func (a *App) Event(ctx context.Context, ev pluginapi.UIEvent, session *pluginap
 		}
 	case "btn_rail_toggle", "btn_rail_expand":
 		s.RailCollapsed = !s.RailCollapsed
+	case "btn_deck_toggle", "btn_top_deck_toggle":
+		s.DeckCollapsed = !s.DeckCollapsed
 
 	case "mode_tabs":
 		if ev.Kind == pluginapi.UIEventSelect && ev.Value != "" {
-			s.Mode = ev.Value
+			a.switchModeLocked(ev.Value)
 		}
 	case "main_tabs":
 		if ev.Kind == pluginapi.UIEventSelect && ev.Value != "" {
@@ -364,61 +549,63 @@ func (a *App) Event(ctx context.Context, ev pluginapi.UIEvent, session *pluginap
 	case "btn_pick_media", "stage_empty":
 		paths := parsePickedPaths(ev.Value)
 		if len(paths) > 0 {
-			s.InputFiles = paths
-			s.ActiveFileIdx = 0
+			ms.InputFiles = paths
+			ms.ActiveFileIdx = 0
 			s.ErrorMsg = ""
 			a.mu.Unlock()
-			a.probeActiveFile(ctx)
+			a.probeActiveFile(ctx, activeMode)
 			return nil
 		}
 	case "files_add":
 		paths := parsePickedPaths(ev.Value)
 		if len(paths) > 0 {
-			hadNone := len(s.InputFiles) == 0
-			s.InputFiles = appendUniquePaths(s.InputFiles, paths)
+			hadNone := len(ms.InputFiles) == 0
+			ms.InputFiles = appendUniquePaths(ms.InputFiles, paths)
 			if hadNone {
-				s.ActiveFileIdx = 0
+				ms.ActiveFileIdx = 0
 				a.mu.Unlock()
-				a.probeActiveFile(ctx)
+				a.probeActiveFile(ctx, activeMode)
 				return nil
 			}
 		}
 	case "btn_clear_files":
-		s.InputFiles = nil
-		s.ActiveFileIdx = 0
-		s.Probe = nil
-		s.IsPlaying = false
-		s.PlayEnded = false
-		s.PlayheadSec = 0
-		s.ProxyAsset = ""
-		s.PosterAsset = ""
-		s.StripAsset = ""
+		a.clearSessionLocked(activeMode)
+		preview.CleanupAssets(a.assetsDir, "ff_"+activeMode+"_")
 
 	case "active_file_select":
-		if idx, err := strconv.Atoi(ev.Value); err == nil && idx >= 0 && idx < len(s.InputFiles) {
-			s.ActiveFileIdx = idx
+		if idx, err := strconv.Atoi(ev.Value); err == nil && idx >= 0 && idx < len(ms.InputFiles) {
+			ms.ActiveFileIdx = idx
 			a.mu.Unlock()
-			a.probeActiveFile(ctx)
+			a.probeActiveFile(ctx, activeMode)
 			return nil
 		}
 
 	// Video Player Telemetry & Transport
 	case "video_player":
 		if ev.Kind == pluginapi.UIEventMedia {
-			prevPlaying, prevEnded, prevReady, prevErr := s.IsPlaying, s.PlayEnded, s.VideoReady, s.VideoErr
-			applyMediaTelemetry(s, ev.Value)
-			if s.VideoReady || s.VideoErr != "" {
-				s.VideoLoadWaiting = false
-				if a.videoWaitTimer != nil {
-					a.videoWaitTimer.Stop()
-					a.videoWaitTimer = nil
+			prevPlaying, prevEnded, prevReady, prevErr := ms.IsPlaying, ms.PlayEnded, ms.VideoReady, ms.VideoErr
+			applyMediaTelemetry(ms, activeMode, ev.Value)
+			stateChanged := ms.IsPlaying != prevPlaying || ms.PlayEnded != prevEnded || ms.VideoReady != prevReady || ms.VideoErr != prevErr
+			if ms.VideoErr != "" && !ms.ProxyTried && s.HasFFmpeg && ms.Probe != nil {
+				switch s.PreviewProxyPolicy {
+				case ProxyPolicyAuto:
+					a.startProxyBuildLocked(ctx, activeMode, ctrl.probeSeq, ms.Probe)
+					stateChanged = true
+				case ProxyPolicyRemuxOnly:
+					if preview.CanFastRemuxProxy(ms.Probe) {
+						a.startProxyBuildLocked(ctx, activeMode, ctrl.probeSeq, ms.Probe)
+					} else {
+						ms.ProxyRequired = true
+						ms.TryNativeOverride = false
+						ms.ProxyReason = "Native player could not decode this file (" + ms.VideoErr + ")."
+					}
+					stateChanged = true
+				case ProxyPolicyManual:
+					ms.ProxyRequired = true
+					ms.TryNativeOverride = false
+					ms.ProxyReason = "Native player could not decode this file (" + ms.VideoErr + ")."
+					stateChanged = true
 				}
-				a.updateLoadingStageLocked()
-			}
-			stateChanged := s.IsPlaying != prevPlaying || s.PlayEnded != prevEnded || s.VideoReady != prevReady || s.VideoErr != prevErr
-			if s.VideoErr != "" && !s.ProxyTried && s.HasFFmpeg && s.Probe != nil {
-				a.startProxyBuildLocked(ctx, a.probeSeq, s.Probe)
-				stateChanged = true
 			}
 			if !stateChanged {
 				a.mu.Unlock()
@@ -426,59 +613,105 @@ func (a *App) Event(ctx context.Context, ev pluginapi.UIEvent, session *pluginap
 			}
 			forceRender = true
 		}
+	case "btn_load_preview":
+		if ms.Probe != nil && s.VideoPreviewMode != VideoPreviewOff {
+			a.activatePreviewLocked(ctx, activeMode)
+		}
+	case "btn_unload_preview":
+		if ctrl.proxyCancel != nil {
+			ctrl.proxyCancel()
+			ctrl.proxyCancel = nil
+		}
+		ms.PreviewLoaded = false
+		ms.ProxyLoading = false
+		ms.ProxyRequired = false
+		ms.IsPlaying = false
+		s.FullscreenOpen = false
+		s.PlaySeq++
+	case "btn_build_proxy":
+		if ms.Probe != nil && s.HasFFmpeg && a.assetsDir != "" {
+			ms.PreviewLoaded = true
+			ms.TryNativeOverride = false
+			a.startProxyBuildLocked(ctx, activeMode, ctrl.probeSeq, ms.Probe)
+		}
+	case "btn_cancel_proxy":
+		if ctrl.proxyCancel != nil {
+			ctrl.proxyCancel()
+			ctrl.proxyCancel = nil
+		}
+		ms.ProxyLoading = false
+		ms.ProxyRequired = true
+		ms.ProxyReason = "Preview proxy canceled. You can still configure settings and export, or rebuild anytime."
+	case "btn_try_native":
+		if ctrl.proxyCancel != nil {
+			ctrl.proxyCancel()
+			ctrl.proxyCancel = nil
+		}
+		ms.ProxyLoading = false
+		ms.ProxyRequired = false
+		ms.TryNativeOverride = true
+		ms.VideoErr = ""
 	case "btn_video_fit":
-		if s.VideoFit == "cover" {
-			s.VideoFit = "contain"
+		if ms.VideoFit == "cover" {
+			ms.VideoFit = "contain"
 		} else {
-			s.VideoFit = "cover"
+			ms.VideoFit = "cover"
 		}
 	case "btn_play_pause", "fs_play_pause":
-		a.togglePlayPauseLocked()
-	case "btn_jump_in":
-		target := s.StartSec
-		if absFloat(s.PlayheadSec-s.StartSec) < 0.15 {
-			target = 0
+		a.togglePlayPauseLocked(ctx)
+	case "btn_jump_in", "fs_jump_in":
+		if modeUsesTrimRange(activeMode) {
+			a.seekToLocked(ms.StartSec)
+		} else {
+			a.seekToLocked(0)
 		}
-		a.seekToLocked(target)
-	case "btn_jump_out":
-		target := s.EndSec
-		if s.Probe != nil && absFloat(s.PlayheadSec-s.EndSec) < 0.15 {
-			target = s.Probe.DurationSec
+	case "btn_jump_out", "fs_jump_out":
+		if modeUsesTrimRange(activeMode) {
+			a.seekToLocked(ms.EndSec)
+		} else if ms.Probe != nil {
+			a.seekToLocked(ms.Probe.DurationSec)
 		}
-		a.seekToLocked(target)
 	case "btn_skip_back", "fs_skip_back":
-		a.seekToLocked(s.PlayheadSec - 5)
+		a.seekToLocked(ms.PlayheadSec - 5)
 	case "btn_skip_fwd", "fs_skip_fwd":
-		a.seekToLocked(s.PlayheadSec + 5)
+		a.seekToLocked(ms.PlayheadSec + 5)
 	case "btn_step_back":
 		a.stepFrameLocked(-1)
 	case "btn_step_fwd":
 		a.stepFrameLocked(+1)
 	case "btn_mark_in", "fs_mark_in":
-		a.markInAtPlayheadLocked()
+		if modeUsesTrimRange(activeMode) {
+			a.markInAtPlayheadLocked()
+		}
 	case "btn_mark_out", "fs_mark_out":
-		a.markOutAtPlayheadLocked()
+		if modeUsesTrimRange(activeMode) {
+			a.markOutAtPlayheadLocked()
+		}
 	case "btn_loop_toggle", "fs_loop_toggle":
-		s.LoopSelection = !s.LoopSelection
+		if modeUsesTrimRange(activeMode) {
+			ms.LoopSelection = !ms.LoopSelection
+		}
 	case "btn_speed_cycle":
-		s.PlaybackRate = nextPlaybackRate(s.PlaybackRate)
+		ms.PlaybackRate = nextPlaybackRate(ms.PlaybackRate)
 	case "btn_mute_toggle":
-		s.Muted = !s.Muted
+		ms.Muted = !ms.Muted
 	case "vol_slider":
 		if v, err := strconv.ParseFloat(ev.Value, 64); err == nil {
-			s.Volume = minFloat(1, maxFloat(0, v))
-			if s.Volume > 0 {
-				s.Muted = false
+			ms.Volume = minFloat(1, maxFloat(0, v))
+			if ms.Volume > 0 {
+				ms.Muted = false
 			}
 			forceRender = false
 		}
 	case "btn_snapshot_hd", "fs_snapshot_hd":
-		sec := s.PlayheadSec
+		sec := ms.PlayheadSec
 		a.mu.Unlock()
-		a.saveHDFrameAsync(ctx, sec, "frame")
+		a.saveHDFrameAsync(ctx, activeMode, sec, "frame")
 		return nil
 	case "btn_fullscreen":
-		s.FullscreenOpen = !s.FullscreenOpen
+		if ms.PreviewLoaded && !ms.ProxyLoading && !ms.ProxyRequired && s.VideoPreviewMode != VideoPreviewOff {
+			s.FullscreenOpen = !s.FullscreenOpen
+		}
 	case "fs_dialog":
 		if ev.Kind == pluginapi.UIEventClose {
 			s.FullscreenOpen = false
@@ -486,13 +719,13 @@ func (a *App) Event(ctx context.Context, ev pluginapi.UIEvent, session *pluginap
 
 	// Modes
 	case "mode_convert":
-		s.Mode = engine.ModeConvert
+		a.switchModeLocked(engine.ModeConvert)
 	case "mode_trim":
-		s.Mode = engine.ModeTrim
+		a.switchModeLocked(engine.ModeTrim)
 	case "mode_streams":
-		s.Mode = engine.ModeStreams
+		a.switchModeLocked(engine.ModeStreams)
 	case "mode_frames":
-		s.Mode = engine.ModeFrames
+		a.switchModeLocked(engine.ModeFrames)
 
 	// Convert controls
 	case "conv_media_kind":
@@ -543,35 +776,35 @@ func (a *App) Event(ctx context.Context, ev pluginapi.UIEvent, session *pluginap
 	case "btn_toggle_cmd":
 		s.ShowCmdPreview = !s.ShowCmdPreview
 
-	// Trim controls
+	// Trim & Playback controls
 	case "trim_lossless":
 		s.Opts.LosslessCut = ev.Value == "true"
 	case "trim_concat_mode":
 		s.Opts.ConcatMode = ev.Value
-	case "trim_canvas":
-		if ev.Kind == pluginapi.UIEventClick && s.Probe != nil && s.Probe.DurationSec > 0 {
+	case "trim_canvas", "playback_canvas":
+		if ev.Kind == pluginapi.UIEventClick && ms.Probe != nil && ms.Probe.DurationSec > 0 {
 			var xPx float64
 			if _, err := fmt.Sscanf(ev.Value, "%f,", &xPx); err == nil {
 				trackW := ComputeTrackWidth(s.ViewportW)
-				a.seekToLocked(XToTime(xPx, s.Probe.DurationSec, trackW))
+				a.seekToLocked(XToTime(xPx, ms.Probe.DurationSec, trackW))
 			}
 		}
 	case "playhead":
-		if ev.Kind == pluginapi.UIEventDragEnd && s.Probe != nil && s.Probe.DurationSec > 0 {
+		if ev.Kind == pluginapi.UIEventDragEnd && ms.Probe != nil && ms.Probe.DurationSec > 0 {
 			var xPx float64
 			_, _ = fmt.Sscanf(ev.Value, "%f,", &xPx)
 			trackW := ComputeTrackWidth(s.ViewportW)
-			a.seekToLocked(ApplyPlayheadDrag(xPx, s.Probe.DurationSec, trackW))
+			a.seekToLocked(ApplyPlayheadDrag(xPx, ms.Probe.DurationSec, trackW))
 		}
 	case "trim_start", "trim_end":
-		if ev.Kind == pluginapi.UIEventDragEnd && s.Probe != nil && s.Probe.DurationSec > 0 {
+		if ev.Kind == pluginapi.UIEventDragEnd && ms.Probe != nil && ms.Probe.DurationSec > 0 {
 			var xPx float64
 			_, _ = fmt.Sscanf(ev.Value, "%f,", &xPx)
 			trackW := ComputeTrackWidth(s.ViewportW)
-			ns, ne := ApplyHandleDrag(ev.Node, xPx, s.StartSec, s.EndSec, s.Probe.DurationSec, trackW)
-			s.StartSec, s.EndSec = ns, ne
-			s.StartText = FormatTimestamp(ns)
-			s.EndText = FormatTimestamp(ne)
+			ns, ne := ApplyHandleDrag(ev.Node, xPx, ms.StartSec, ms.EndSec, ms.Probe.DurationSec, trackW)
+			ms.StartSec, ms.EndSec = ns, ne
+			ms.StartText = FormatTimestamp(ns)
+			ms.EndText = FormatTimestamp(ne)
 			if ev.Node == "trim_start" {
 				a.seekToLocked(ns)
 			} else {
@@ -579,38 +812,38 @@ func (a *App) Event(ctx context.Context, ev pluginapi.UIEvent, session *pluginap
 			}
 		}
 	case "trim_window":
-		if ev.Kind == pluginapi.UIEventDragEnd && s.Probe != nil && s.Probe.DurationSec > 0 {
+		if ev.Kind == pluginapi.UIEventDragEnd && ms.Probe != nil && ms.Probe.DurationSec > 0 {
 			var xPx float64
 			_, _ = fmt.Sscanf(ev.Value, "%f,", &xPx)
 			trackW := ComputeTrackWidth(s.ViewportW)
-			ns, ne := ApplyWindowDrag(xPx-float64(HandleWidth)/2, s.StartSec, s.EndSec, s.Probe.DurationSec, trackW)
-			s.StartSec, s.EndSec = ns, ne
-			s.StartText = FormatTimestamp(ns)
-			s.EndText = FormatTimestamp(ne)
+			ns, ne := ApplyWindowDrag(xPx-float64(HandleWidth)/2, ms.StartSec, ms.EndSec, ms.Probe.DurationSec, trackW)
+			ms.StartSec, ms.EndSec = ns, ne
+			ms.StartText = FormatTimestamp(ns)
+			ms.EndText = FormatTimestamp(ne)
 			a.seekToLocked(ns)
 		}
 	case "time_start_input":
-		s.StartText = ev.Value
-		if sec, ok := ParseTimestamp(ev.Value); ok && s.Probe != nil {
-			if s.Probe.DurationSec > 0 && sec > s.Probe.DurationSec {
-				sec = s.Probe.DurationSec
+		ms.StartText = ev.Value
+		if sec, ok := ParseTimestamp(ev.Value); ok && ms.Probe != nil {
+			if ms.Probe.DurationSec > 0 && sec > ms.Probe.DurationSec {
+				sec = ms.Probe.DurationSec
 			}
-			if sec >= s.EndSec {
-				sec = maxFloat(0, s.EndSec-0.5)
+			if sec >= ms.EndSec {
+				sec = maxFloat(0, ms.EndSec-0.5)
 			}
-			s.StartSec = sec
+			ms.StartSec = sec
 			a.seekToLocked(sec)
 		}
 	case "time_end_input":
-		s.EndText = ev.Value
-		if sec, ok := ParseTimestamp(ev.Value); ok && s.Probe != nil {
-			if s.Probe.DurationSec > 0 && sec > s.Probe.DurationSec {
-				sec = s.Probe.DurationSec
+		ms.EndText = ev.Value
+		if sec, ok := ParseTimestamp(ev.Value); ok && ms.Probe != nil {
+			if ms.Probe.DurationSec > 0 && sec > ms.Probe.DurationSec {
+				sec = ms.Probe.DurationSec
 			}
-			if sec <= s.StartSec {
-				sec = s.StartSec + 0.5
+			if sec <= ms.StartSec {
+				sec = ms.StartSec + 0.5
 			}
-			s.EndSec = sec
+			ms.EndSec = sec
 			a.seekToLocked(sec)
 		}
 	case "btn_start_minus":
@@ -622,15 +855,15 @@ func (a *App) Event(ctx context.Context, ev pluginapi.UIEvent, session *pluginap
 	case "btn_end_plus":
 		a.nudgeEndLocked(+1)
 	case "btn_trim_reset":
-		s.StartSec = 0
-		if s.Probe != nil && s.Probe.DurationSec > 0 {
-			s.EndSec = s.Probe.DurationSec
-			s.StartText = FormatTimestamp(0)
-			s.EndText = FormatTimestamp(s.Probe.DurationSec)
+		ms.StartSec = 0
+		if ms.Probe != nil && ms.Probe.DurationSec > 0 {
+			ms.EndSec = ms.Probe.DurationSec
+			ms.StartText = FormatTimestamp(0)
+			ms.EndText = FormatTimestamp(ms.Probe.DurationSec)
 		} else {
-			s.EndSec = 0
-			s.StartText = ""
-			s.EndText = ""
+			ms.EndSec = 0
+			ms.StartText = ""
+			ms.EndText = ""
 		}
 		a.seekToLocked(0)
 	case "btn_add_clip":
@@ -721,7 +954,7 @@ func (a *App) Event(ctx context.Context, ev pluginapi.UIEvent, session *pluginap
 	default:
 		if switchFile := a.handleDynamicNodeLocked(ev); switchFile {
 			a.mu.Unlock()
-			a.probeActiveFile(ctx)
+			a.probeActiveFile(ctx, activeMode)
 			return nil
 		}
 	}
@@ -732,42 +965,106 @@ func (a *App) Event(ctx context.Context, ev pluginapi.UIEvent, session *pluginap
 	return nil
 }
 
+func (a *App) switchModeLocked(nextMode string) {
+	s := &a.state
+	next := normalizeMode(nextMode)
+	cur := normalizeMode(s.Mode)
+	if next == cur {
+		return
+	}
+	prevSess := s.SessionFor(cur)
+	prevSess.IsPlaying = false
+	s.FullscreenOpen = false
+	s.Mode = next
+	nextSess := s.SessionFor(next)
+	nextSess.IsPlaying = false
+	s.PlaySeq++
+	if nextSess.Probe != nil {
+		nextSess.SeekTargetSec = nextSess.PlayheadSec
+		s.SeekSeq++
+	}
+}
+
+func (a *App) clearSessionLocked(mode string) {
+	ctrl := a.workerCtrlLocked(mode)
+	if ctrl.probeCancel != nil {
+		ctrl.probeCancel()
+		ctrl.probeCancel = nil
+	}
+	if ctrl.stripCancel != nil {
+		ctrl.stripCancel()
+		ctrl.stripCancel = nil
+	}
+	if ctrl.proxyCancel != nil {
+		ctrl.proxyCancel()
+		ctrl.proxyCancel = nil
+	}
+	ctrl.probeSeq++
+	ms := a.state.SessionFor(mode)
+	rate := ms.PlaybackRate
+	if rate <= 0 {
+		rate = 1.0
+	}
+	vol := ms.Volume
+	muted := ms.Muted
+	fit := ms.VideoFit
+	*ms = defaultModeSession()
+	ms.PlaybackRate = rate
+	ms.Volume = vol
+	ms.Muted = muted
+	if fit != "" {
+		ms.VideoFit = fit
+	}
+}
+
 func (a *App) handleShortcutLocked(ctx context.Context, spec string) bool {
 	s := &a.state
+	activeMode := normalizeMode(s.Mode)
+	ms := s.SessionFor(activeMode)
 	switch strings.ToLower(strings.TrimSpace(spec)) {
 	case "escape":
 		s.FullscreenOpen = false
 	case "space", "k":
-		a.togglePlayPauseLocked()
+		a.togglePlayPauseLocked(ctx)
 	case "j":
-		a.seekToLocked(s.PlayheadSec - 5)
+		a.seekToLocked(ms.PlayheadSec - 5)
 	case "l":
-		a.seekToLocked(s.PlayheadSec + 5)
+		a.seekToLocked(ms.PlayheadSec + 5)
 	case "i":
-		a.markInAtPlayheadLocked()
+		if modeUsesTrimRange(activeMode) {
+			a.markInAtPlayheadLocked()
+		}
 	case "o":
-		a.markOutAtPlayheadLocked()
+		if modeUsesTrimRange(activeMode) {
+			a.markOutAtPlayheadLocked()
+		}
 	case "home":
-		a.seekToLocked(s.StartSec)
+		if modeUsesTrimRange(activeMode) {
+			a.seekToLocked(ms.StartSec)
+		}
 	case "end":
-		a.seekToLocked(s.EndSec)
+		if modeUsesTrimRange(activeMode) {
+			a.seekToLocked(ms.EndSec)
+		}
 	case ",":
 		a.stepFrameLocked(-1)
 	case ".":
 		a.stepFrameLocked(+1)
 	case "m":
-		s.Muted = !s.Muted
+		ms.Muted = !ms.Muted
 	case "f":
-		if s.Probe != nil && s.Probe.HasVideo() {
+		if ms.Probe != nil && ms.Probe.HasVideo() && ms.PreviewLoaded && !ms.ProxyLoading && !ms.ProxyRequired && s.VideoPreviewMode != VideoPreviewOff {
 			s.FullscreenOpen = !s.FullscreenOpen
 		}
 	case "shift+l":
-		s.LoopSelection = !s.LoopSelection
+		if modeUsesTrimRange(activeMode) {
+			ms.LoopSelection = !ms.LoopSelection
+		}
 	case "s":
-		if s.Probe != nil && s.Probe.HasVideo() && s.HasFFmpeg {
-			sec := s.PlayheadSec
+		if ms.Probe != nil && ms.Probe.HasVideo() && s.HasFFmpeg {
+			sec := ms.PlayheadSec
 			a.mu.Unlock()
-			a.saveHDFrameAsync(ctx, sec, "frame")
+			a.saveHDFrameAsync(ctx, activeMode, sec, "frame")
 			a.mu.Lock()
 			return true
 		}
@@ -777,53 +1074,51 @@ func (a *App) handleShortcutLocked(ctx context.Context, spec string) bool {
 
 func (a *App) handleDynamicNodeLocked(ev pluginapi.UIEvent) bool {
 	s := &a.state
+	activeMode := normalizeMode(s.Mode)
+	ms := s.SessionFor(activeMode)
 	switch {
 	case strings.HasPrefix(ev.Node, "preset_"):
 		ApplyConvertPreset(s, strings.TrimPrefix(ev.Node, "preset_"))
 	case strings.HasPrefix(ev.Node, "file_select_"):
-		if idx, err := strconv.Atoi(strings.TrimPrefix(ev.Node, "file_select_")); err == nil && idx >= 0 && idx < len(s.InputFiles) {
-			s.ActiveFileIdx = idx
+		if idx, err := strconv.Atoi(strings.TrimPrefix(ev.Node, "file_select_")); err == nil && idx >= 0 && idx < len(ms.InputFiles) {
+			ms.ActiveFileIdx = idx
 			return true
 		}
 	case strings.HasPrefix(ev.Node, "file_remove_"):
-		if idx, err := strconv.Atoi(strings.TrimPrefix(ev.Node, "file_remove_")); err == nil && idx >= 0 && idx < len(s.InputFiles) {
-			wasActive := idx == s.ActiveFileIdx
-			s.InputFiles = append(s.InputFiles[:idx], s.InputFiles[idx+1:]...)
-			if len(s.InputFiles) == 0 {
-				s.ActiveFileIdx = 0
-				s.Probe = nil
-				s.IsPlaying = false
-				s.ProxyAsset = ""
-				s.PosterAsset = ""
-				s.StripAsset = ""
+		if idx, err := strconv.Atoi(strings.TrimPrefix(ev.Node, "file_remove_")); err == nil && idx >= 0 && idx < len(ms.InputFiles) {
+			wasActive := idx == ms.ActiveFileIdx
+			ms.InputFiles = append(ms.InputFiles[:idx], ms.InputFiles[idx+1:]...)
+			if len(ms.InputFiles) == 0 {
+				a.clearSessionLocked(activeMode)
+				preview.CleanupAssets(a.assetsDir, "ff_"+activeMode+"_")
 				return false
 			}
-			if s.ActiveFileIdx >= len(s.InputFiles) {
-				s.ActiveFileIdx = len(s.InputFiles) - 1
+			if ms.ActiveFileIdx >= len(ms.InputFiles) {
+				ms.ActiveFileIdx = len(ms.InputFiles) - 1
 			}
 			return wasActive
 		}
 	case strings.HasPrefix(ev.Node, "clip_select_"):
 		id := strings.TrimPrefix(ev.Node, "clip_select_")
-		for _, cl := range s.Clips {
+		for _, cl := range ms.Clips {
 			if cl.ID == id {
-				s.StartSec = cl.StartSec
-				s.EndSec = cl.EndSec
-				s.StartText = FormatTimestamp(cl.StartSec)
-				s.EndText = FormatTimestamp(cl.EndSec)
+				ms.StartSec = cl.StartSec
+				ms.EndSec = cl.EndSec
+				ms.StartText = FormatTimestamp(cl.StartSec)
+				ms.EndText = FormatTimestamp(cl.EndSec)
 				a.seekToLocked(cl.StartSec)
 				break
 			}
 		}
 	case strings.HasPrefix(ev.Node, "clip_remove_"):
 		id := strings.TrimPrefix(ev.Node, "clip_remove_")
-		filtered := s.Clips[:0]
-		for _, cl := range s.Clips {
+		filtered := ms.Clips[:0]
+		for _, cl := range ms.Clips {
 			if cl.ID != id {
 				filtered = append(filtered, cl)
 			}
 		}
-		s.Clips = filtered
+		ms.Clips = filtered
 	case strings.HasPrefix(ev.Node, "q_remove_"):
 		id := strings.TrimPrefix(ev.Node, "q_remove_")
 		a.queueMgr.Remove(id)
@@ -831,113 +1126,139 @@ func (a *App) handleDynamicNodeLocked(ev pluginapi.UIEvent) bool {
 	return false
 }
 
-func (a *App) togglePlayPauseLocked() {
+func (a *App) togglePlayPauseLocked(ctx context.Context) {
 	s := &a.state
-	if s.Probe == nil {
+	activeMode := normalizeMode(s.Mode)
+	ms := s.SessionFor(activeMode)
+	if ms.Probe == nil || s.VideoPreviewMode == VideoPreviewOff {
 		return
 	}
-	if s.PlayEnded && !s.IsPlaying {
-		target := s.StartSec
-		if target < 0 || target >= s.Probe.DurationSec {
-			target = 0
+	if !ms.PreviewLoaded {
+		a.activatePreviewLocked(ctx, activeMode)
+		if ms.ProxyLoading || ms.ProxyRequired {
+			return
 		}
-		a.seekToLocked(target)
-		s.PlayEnded = false
-		s.IsPlaying = true
+	}
+	if !ms.IsPlaying {
+		if modeUsesTrimRange(s.Mode) && ms.EndSec > ms.StartSec {
+			if ms.PlayEnded || ms.PlayheadSec < ms.StartSec-0.05 || ms.PlayheadSec >= ms.EndSec-0.05 {
+				a.seekToLocked(ms.StartSec)
+			}
+		} else if ms.PlayEnded {
+			a.seekToLocked(0)
+		}
+		ms.PlayEnded = false
+		ms.IsPlaying = true
 		s.PlaySeq++
 		return
 	}
-	s.IsPlaying = !s.IsPlaying
+	ms.IsPlaying = false
 	s.PlaySeq++
 }
 
 func (a *App) seekToLocked(sec float64) {
 	s := &a.state
-	if s.Probe == nil {
+	ms := s.ActiveSession()
+	if ms.Probe == nil {
 		return
 	}
-	dur := s.Probe.DurationSec
+	dur := ms.Probe.DurationSec
 	if sec < 0 {
 		sec = 0
 	}
 	if dur > 0 && sec > dur {
 		sec = dur
 	}
-	s.PlayheadSec = sec
-	s.SeekTargetSec = sec
+	upperBound := dur
+	if modeUsesTrimRange(s.Mode) && ms.EndSec > ms.StartSec {
+		if sec < ms.StartSec {
+			sec = ms.StartSec
+		}
+		if sec > ms.EndSec {
+			sec = ms.EndSec
+		}
+		upperBound = ms.EndSec
+	}
+	ms.PlayheadSec = sec
+	ms.SeekTargetSec = sec
 	s.SeekSeq++
-	if dur <= 0 || sec < dur-0.05 {
-		s.PlayEnded = false
+	if upperBound <= 0 || sec < upperBound-0.05 {
+		ms.PlayEnded = false
 	}
 }
 
 func (a *App) stepFrameLocked(dir int) {
 	s := &a.state
-	if s.Probe == nil {
+	ms := s.ActiveSession()
+	if ms.Probe == nil {
 		return
 	}
-	if s.IsPlaying {
-		s.IsPlaying = false
+	if ms.IsPlaying {
+		ms.IsPlaying = false
 		s.PlaySeq++
 	}
 	step := 0.04 // 25fps fallback
-	if s.Probe.HasVideo() && s.Probe.VideoStreams[0].FPS > 0 {
-		step = 1.0 / s.Probe.VideoStreams[0].FPS
+	if ms.Probe.HasVideo() && ms.Probe.VideoStreams[0].FPS > 0 {
+		step = 1.0 / ms.Probe.VideoStreams[0].FPS
 	}
-	a.seekToLocked(s.PlayheadSec + float64(dir)*step)
+	a.seekToLocked(ms.PlayheadSec + float64(dir)*step)
 }
 
 func (a *App) markInAtPlayheadLocked() {
 	s := &a.state
-	if s.Probe == nil || s.Probe.DurationSec <= 0 {
+	ms := s.ActiveSession()
+	if ms.Probe == nil || ms.Probe.DurationSec <= 0 {
 		return
 	}
-	ns := maxFloat(0, minFloat(s.PlayheadSec, s.EndSec-0.5))
-	s.StartSec = ns
-	s.StartText = FormatTimestamp(ns)
+	ns := maxFloat(0, minFloat(ms.PlayheadSec, ms.EndSec-0.5))
+	ms.StartSec = ns
+	ms.StartText = FormatTimestamp(ns)
 }
 
 func (a *App) markOutAtPlayheadLocked() {
 	s := &a.state
-	if s.Probe == nil || s.Probe.DurationSec <= 0 {
+	ms := s.ActiveSession()
+	if ms.Probe == nil || ms.Probe.DurationSec <= 0 {
 		return
 	}
-	ne := minFloat(s.Probe.DurationSec, maxFloat(s.PlayheadSec, s.StartSec+0.5))
-	s.EndSec = ne
-	s.EndText = FormatTimestamp(ne)
+	ne := minFloat(ms.Probe.DurationSec, maxFloat(ms.PlayheadSec, ms.StartSec+0.5))
+	ms.EndSec = ne
+	ms.EndText = FormatTimestamp(ne)
 }
 
 func (a *App) nudgeStartLocked(delta float64) {
 	s := &a.state
-	if s.Probe == nil || s.Probe.DurationSec <= 0 {
+	ms := s.ActiveSession()
+	if ms.Probe == nil || ms.Probe.DurationSec <= 0 {
 		return
 	}
-	ns := s.StartSec + delta
+	ns := ms.StartSec + delta
 	if ns < 0 {
 		ns = 0
 	}
-	if ns > s.EndSec-0.5 {
-		ns = maxFloat(0, s.EndSec-0.5)
+	if ns > ms.EndSec-0.5 {
+		ns = maxFloat(0, ms.EndSec-0.5)
 	}
-	s.StartSec = ns
-	s.StartText = FormatTimestamp(ns)
+	ms.StartSec = ns
+	ms.StartText = FormatTimestamp(ns)
 	a.seekToLocked(ns)
 }
 
 func (a *App) nudgeEndLocked(delta float64) {
 	s := &a.state
-	if s.Probe == nil || s.Probe.DurationSec <= 0 {
+	ms := s.ActiveSession()
+	if ms.Probe == nil || ms.Probe.DurationSec <= 0 {
 		return
 	}
-	ne := s.EndSec + delta
-	if ne > s.Probe.DurationSec {
-		ne = s.Probe.DurationSec
+	ne := ms.EndSec + delta
+	if ne > ms.Probe.DurationSec {
+		ne = ms.Probe.DurationSec
 	}
-	if ne < s.StartSec+0.5 {
-		ne = minFloat(s.Probe.DurationSec, s.StartSec+0.5)
+	if ne < ms.StartSec+0.5 {
+		ne = minFloat(ms.Probe.DurationSec, ms.StartSec+0.5)
 	}
-	s.EndSec = ne
-	s.EndText = FormatTimestamp(ne)
+	ms.EndSec = ne
+	ms.EndText = FormatTimestamp(ne)
 	a.seekToLocked(ne)
 }
 
@@ -955,6 +1276,112 @@ func (a *App) applySettingsLocked(settings map[string]string) {
 		}
 	}
 	a.state.Opts.Overwrite = settings["overwrite_policy"] == "overwrite"
+	a.state.VideoPreviewMode = normalizeVideoPreviewMode(settings["video_preview"])
+	a.state.TimelineFilmstrip = strings.TrimSpace(settings["timeline_filmstrip"]) != "false"
+	a.state.PreviewProxyPolicy = normalizeProxyPolicy(settings["preview_proxy"])
+	a.state.HWAccelMode = engine.NormalizeHWAccelMode(settings["hardware_accel"])
+	a.state.HWBackend = engine.NormalizeHWBackend(settings["hardware_backend"])
+}
+
+func (a *App) reloadSettingsFromDiskLocked(force bool) bool {
+	if a.settingsFile == "" {
+		return false
+	}
+	info, err := os.Stat(a.settingsFile)
+	if err != nil {
+		return false
+	}
+	if !force && !a.settingsModTime.IsZero() && info.ModTime().Equal(a.settingsModTime) {
+		return false
+	}
+	data, err := os.ReadFile(a.settingsFile)
+	if err != nil {
+		return false
+	}
+	var loaded map[string]any
+	if err := json.Unmarshal(data, &loaded); err != nil {
+		return false
+	}
+	merged := make(map[string]string, len(a.state.Settings)+len(loaded))
+	for k, v := range a.state.Settings {
+		merged[k] = v
+	}
+	for k, v := range loaded {
+		switch tv := v.(type) {
+		case string:
+			merged[k] = tv
+		case bool:
+			merged[k] = strconv.FormatBool(tv)
+		}
+	}
+	if merged["ffmpeg_path"] != a.state.Settings["ffmpeg_path"] {
+		a.ffCache = cachedBin{}
+		a.hwCache = cachedHWCaps{}
+	}
+	if merged["ffprobe_path"] != a.state.Settings["ffprobe_path"] {
+		a.fpCache = cachedBin{}
+	}
+	a.settingsModTime = info.ModTime()
+	a.applySettingsLocked(merged)
+	return true
+}
+
+func (a *App) reconcileSessionsWithSettingsLocked(ctx context.Context) {
+	allModes := []string{engine.ModeConvert, engine.ModeTrim, engine.ModeStreams, engine.ModeFrames}
+	activeMode := normalizeMode(a.state.Mode)
+	for _, m := range allModes {
+		ms := a.state.SessionFor(m)
+		ctrl := a.workerCtrlLocked(m)
+		if a.state.VideoPreviewMode == VideoPreviewOff {
+			if ctrl.proxyCancel != nil {
+				ctrl.proxyCancel()
+				ctrl.proxyCancel = nil
+			}
+			ms.PreviewLoaded = false
+			ms.ProxyLoading = false
+			ms.ProxyRequired = false
+			ms.IsPlaying = false
+			if m == activeMode {
+				a.state.FullscreenOpen = false
+				a.state.PlaySeq++
+			}
+		}
+		if !a.state.TimelineFilmstrip {
+			if ctrl.stripCancel != nil {
+				ctrl.stripCancel()
+				ctrl.stripCancel = nil
+			}
+			ms.FilmstripLoading = false
+			ms.StripAsset = ""
+		}
+	}
+
+	ms := a.state.SessionFor(activeMode)
+	ctrl := a.workerCtrlLocked(activeMode)
+	if ms.Probe == nil || ms.ProbeLoading {
+		return
+	}
+	if a.state.TimelineFilmstrip && modeUsesTrimRange(activeMode) && ms.Probe.HasVideo() && ms.Probe.DurationSec > 0 && ms.StripAsset == "" && !ms.FilmstripLoading && a.assetsDir != "" && a.state.HasFFmpeg {
+		a.startFilmstripBuildLocked(ctx, activeMode, ctrl.probeSeq, ms.Probe)
+	}
+	if shouldAutoPreview(a.state.VideoPreviewMode, activeMode) && !ms.PreviewLoaded {
+		a.activatePreviewLocked(ctx, activeMode)
+	}
+	if ms.PreviewLoaded && ms.ProxyRequired && !ms.ProxyLoading && ms.ProxyAsset == "" {
+		switch a.state.PreviewProxyPolicy {
+		case ProxyPolicyOff:
+			ms.ProxyRequired = false
+			ms.TryNativeOverride = true
+		case ProxyPolicyAuto:
+			if a.assetsDir != "" && a.state.HasFFmpeg {
+				a.startProxyBuildLocked(ctx, activeMode, ctrl.probeSeq, ms.Probe)
+			}
+		case ProxyPolicyRemuxOnly:
+			if preview.CanFastRemuxProxy(ms.Probe) && a.assetsDir != "" && a.state.HasFFmpeg {
+				a.startProxyBuildLocked(ctx, activeMode, ctrl.probeSeq, ms.Probe)
+			}
+		}
+	}
 }
 
 func (a *App) refreshHelpersLocked() {
@@ -971,138 +1398,132 @@ func (a *App) refreshHelpersLocked() {
 	a.state.FFmpegPath = a.ffCache.path
 	a.state.HasFFprobe = a.fpCache.err == nil
 	a.state.FFprobePath = a.fpCache.path
-}
-
-func (a *App) updateLoadingStageLocked() {
-	s := &a.state
-	switch {
-	case s.ProbeLoading:
-		s.LoadingStage = "Inspecting media streams…"
-		s.LoadingPct = 15
-	case s.ProxyLoading && s.FilmstripLoading:
-		s.LoadingStage = "Preparing playback proxy & timeline filmstrip…"
-		s.LoadingPct = 35
-	case s.ProxyLoading:
-		s.LoadingStage = "Preparing smooth playback proxy…"
-		s.LoadingPct = 55
-	case s.FilmstripLoading:
-		s.LoadingStage = "Building timeline filmstrip…"
-		s.LoadingPct = 55
-	case s.VideoLoadWaiting:
-		s.LoadingStage = "Loading video player…"
-		s.LoadingPct = 85
-	default:
-		s.LoadingStage = ""
-		s.LoadingPct = 100
-	}
-}
-
-func (a *App) armVideoReadyFallbackLocked(seq uint64) {
-	if a.videoWaitTimer != nil {
-		a.videoWaitTimer.Stop()
-	}
-	a.videoWaitTimer = time.AfterFunc(6*time.Second, func() {
-		a.mu.Lock()
-		if seq != a.probeSeq || !a.state.VideoLoadWaiting {
-			a.mu.Unlock()
-			return
+	if a.state.HasFFmpeg {
+		if !a.hwCache.checked || a.hwCache.ffPath != a.state.FFmpegPath {
+			a.hwCache = cachedHWCaps{
+				ffPath:  a.state.FFmpegPath,
+				caps:    engine.ProbeHWCapabilities(context.Background(), a.state.FFmpegPath),
+				checked: true,
+			}
 		}
-		a.state.VideoLoadWaiting = false
-		a.updateLoadingStageLocked()
-		t := RenderTree(a.state)
-		a.mu.Unlock()
-		a.renderTree(t, true)
-	})
+		a.state.HWCaps = a.hwCache.caps
+	} else {
+		a.state.HWCaps = engine.HWCapabilities{}
+	}
+	a.state.HWPlan = engine.ResolveHWPlan(a.state.HWAccelMode, a.state.HWBackend, a.state.HWCaps, runtime.GOOS)
 }
 
-func (a *App) cancelLoadingLocked() {
-	if a.probeCancel != nil {
-		a.probeCancel()
-		a.probeCancel = nil
+func (a *App) updateLoadingStageLocked(mode string) {
+	ms := a.state.SessionFor(mode)
+	if ms.ProbeLoading {
+		ms.LoadingStage = "Inspecting media streams…"
+		ms.LoadingPct = 25
+		return
 	}
-	if a.proxyCancel != nil {
-		a.proxyCancel()
-		a.proxyCancel = nil
-	}
-	if a.videoWaitTimer != nil {
-		a.videoWaitTimer.Stop()
-		a.videoWaitTimer = nil
-	}
-	a.probeSeq++
-	s := &a.state
-	s.ProbeLoading = false
-	s.FilmstripLoading = false
-	s.ProxyLoading = false
-	s.VideoLoadWaiting = false
-	s.LoadingStage = ""
-	s.LoadingFile = ""
-	s.LoadingPct = 0
-	s.IsPlaying = false
-	s.PlayEnded = false
-	s.PlayheadSec = 0
-	s.VideoReady = false
-	s.VideoErr = ""
-	s.Probe = nil
-	s.StripAsset = ""
-	s.PosterAsset = ""
-	s.ProxyAsset = ""
-	s.StatusMsg = "Media loading canceled."
+	ms.LoadingStage = ""
+	ms.LoadingPct = 100
 }
 
-func (a *App) probeActiveFile(parentCtx context.Context) {
+func (a *App) cancelLoadingLocked(mode string) {
+	ctrl := a.workerCtrlLocked(mode)
+	if ctrl.probeCancel != nil {
+		ctrl.probeCancel()
+		ctrl.probeCancel = nil
+	}
+	if ctrl.stripCancel != nil {
+		ctrl.stripCancel()
+		ctrl.stripCancel = nil
+	}
+	if ctrl.proxyCancel != nil {
+		ctrl.proxyCancel()
+		ctrl.proxyCancel = nil
+	}
+	ctrl.probeSeq++
+	ms := a.state.SessionFor(mode)
+	ms.ProbeLoading = false
+	ms.FilmstripLoading = false
+	ms.ProxyLoading = false
+	ms.PreviewLoaded = false
+	ms.ProxyRequired = false
+	ms.ProxyReason = ""
+	ms.ProxyStage = ""
+	ms.TryNativeOverride = false
+	ms.LoadingStage = ""
+	ms.LoadingFile = ""
+	ms.LoadingPct = 0
+	ms.IsPlaying = false
+	ms.PlayEnded = false
+	ms.PlayheadSec = 0
+	ms.VideoReady = false
+	ms.VideoErr = ""
+	ms.Probe = nil
+	ms.StripAsset = ""
+	ms.PosterAsset = ""
+	ms.ProxyAsset = ""
+	a.state.StatusMsg = "Media loading canceled."
+}
+
+func (a *App) probeActiveFile(parentCtx context.Context, mode string) {
+	m := normalizeMode(mode)
 	a.mu.Lock()
-	if len(a.state.InputFiles) == 0 || a.state.ActiveFileIdx >= len(a.state.InputFiles) {
+	ms := a.state.SessionFor(m)
+	if len(ms.InputFiles) == 0 || ms.ActiveFileIdx >= len(ms.InputFiles) {
 		a.mu.Unlock()
 		return
 	}
 	if !a.state.HasFFmpeg {
-		a.state.ProbeError = "FFmpeg is required to inspect media files. Click Download FFmpeg above."
+		ms.ProbeError = "FFmpeg is required to inspect media files. Click Download FFmpeg above."
 		tree := RenderTree(a.state)
 		a.mu.Unlock()
 		a.renderTree(tree, true)
 		return
 	}
-	if a.probeCancel != nil {
-		a.probeCancel()
+	ctrl := a.workerCtrlLocked(m)
+	if ctrl.probeCancel != nil {
+		ctrl.probeCancel()
 	}
-	if a.proxyCancel != nil {
-		a.proxyCancel()
-		a.proxyCancel = nil
+	if ctrl.stripCancel != nil {
+		ctrl.stripCancel()
+		ctrl.stripCancel = nil
 	}
-	if a.videoWaitTimer != nil {
-		a.videoWaitTimer.Stop()
-		a.videoWaitTimer = nil
+	if ctrl.proxyCancel != nil {
+		ctrl.proxyCancel()
+		ctrl.proxyCancel = nil
 	}
 	pctx, cancel := context.WithCancel(parentCtx)
-	a.probeCancel = cancel
-	a.probeSeq++
-	seq := a.probeSeq
+	ctrl.probeCancel = cancel
+	ctrl.probeSeq++
+	seq := ctrl.probeSeq
 
-	filePath := a.state.InputFiles[a.state.ActiveFileIdx]
+	filePath := ms.InputFiles[ms.ActiveFileIdx]
 	ffBin := a.state.FFmpegPath
 	fpBin := a.state.FFprobePath
 	assetsDir := a.assetsDir
-	a.state.ProbeLoading = true
-	a.state.FilmstripLoading = false
-	a.state.VideoLoadWaiting = false
-	a.state.ProbeError = ""
+	ms.ProbeLoading = true
+	ms.FilmstripLoading = false
+	ms.PreviewLoaded = false
+	ms.ProxyRequired = false
+	ms.ProxyReason = ""
+	ms.ProxyStage = ""
+	ms.TryNativeOverride = false
+	ms.ProbeError = ""
 	a.state.ErrorMsg = ""
-	a.state.IsPlaying = false
-	a.state.PlayEnded = false
-	a.state.PlayheadSec = 0
-	a.state.SeekTargetSec = 0
+	ms.IsPlaying = false
+	ms.PlayEnded = false
+	ms.PlayheadSec = 0
+	ms.SeekTargetSec = 0
 	a.state.PlaySeq++
 	a.state.SeekSeq++
-	a.state.VideoReady = false
-	a.state.VideoErr = ""
-	a.state.ProxyAsset = ""
-	a.state.StripAsset = ""
-	a.state.PosterAsset = ""
-	a.state.ProxyLoading = false
-	a.state.ProxyTried = false
+	ms.VideoReady = false
+	ms.VideoErr = ""
+	ms.ProxyAsset = ""
+	ms.StripAsset = ""
+	ms.PosterAsset = ""
+	ms.ProxyLoading = false
+	ms.ProxyTried = false
 	a.state.FullscreenOpen = false
-	a.state.LoadingFile = filepath.Base(filePath)
-	a.updateLoadingStageLocked()
+	ms.LoadingFile = filepath.Base(filePath)
+	a.updateLoadingStageLocked(m)
 	a.state.StatusMsg = ""
 	tree := RenderTree(a.state)
 	a.mu.Unlock()
@@ -1116,13 +1537,14 @@ func (a *App) probeActiveFile(parentCtx context.Context) {
 		}
 		if err != nil {
 			a.mu.Lock()
-			if seq == a.probeSeq {
-				a.state.ProbeLoading = false
-				a.state.FilmstripLoading = false
-				a.state.ProxyLoading = false
-				a.state.VideoLoadWaiting = false
-				a.updateLoadingStageLocked()
-				a.state.ProbeError = err.Error()
+			curCtrl := a.workerCtrlLocked(m)
+			curMS := a.state.SessionFor(m)
+			if seq == curCtrl.probeSeq {
+				curMS.ProbeLoading = false
+				curMS.FilmstripLoading = false
+				curMS.ProxyLoading = false
+				a.updateLoadingStageLocked(m)
+				curMS.ProbeError = err.Error()
 				a.state.StatusMsg = ""
 				t := RenderTree(a.state)
 				a.mu.Unlock()
@@ -1133,143 +1555,199 @@ func (a *App) probeActiveFile(parentCtx context.Context) {
 			return
 		}
 
-		preview.CleanupAssets(assetsDir, "ff_")
+		preview.CleanupAssets(assetsDir, "ff_"+m+"_")
 		a.mu.Lock()
-		if seq != a.probeSeq {
+		curCtrl := a.workerCtrlLocked(m)
+		if seq != curCtrl.probeSeq {
 			a.mu.Unlock()
 			return
 		}
-		a.state.AssetRev++
-		rev := a.state.AssetRev
-		a.state.ProbeLoading = false
-		a.state.Probe = probe
-		a.state.StartSec = 0
-		a.state.EndSec = probe.DurationSec
-		a.state.StartText = FormatTimestamp(0)
-		a.state.EndText = FormatTimestamp(probe.DurationSec)
-		a.state.Clips = nil
+		curMS := a.state.SessionFor(m)
+		curMS.ProbeLoading = false
+		curMS.Probe = probe
+		curMS.StartSec = 0
+		curMS.EndSec = probe.DurationSec
+		curMS.StartText = FormatTimestamp(0)
+		curMS.EndText = FormatTimestamp(probe.DurationSec)
+		curMS.Clips = nil
 		a.state.StatusMsg = ""
+		a.updateLoadingStageLocked(m)
 
-		needStrip := assetsDir != "" && probe.HasVideo() && probe.DurationSec > 0
-		needProxy := assetsDir != "" && preview.NeedsPreviewProxy(probe)
-		needPlayerWait := probe.HasVideo()
-		a.state.FilmstripLoading = needStrip
-		a.state.ProxyLoading = needProxy
-		a.state.ProxyTried = needProxy
-		a.state.VideoLoadWaiting = needPlayerWait
-		a.updateLoadingStageLocked()
-		if needPlayerWait && !needProxy {
-			a.armVideoReadyFallbackLocked(seq)
+		if a.state.TimelineFilmstrip && modeUsesTrimRange(m) && probe.HasVideo() && probe.DurationSec > 0 && assetsDir != "" {
+			a.startFilmstripBuildLocked(parentCtx, m, seq, probe)
+		}
+		if shouldAutoPreview(a.state.VideoPreviewMode, m) {
+			a.activatePreviewLocked(parentCtx, m)
 		}
 		initialTree := RenderTree(a.state)
 		a.mu.Unlock()
 		a.renderTree(initialTree, true)
-
-		var wg sync.WaitGroup
-		if needStrip {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				sName := fmt.Sprintf("ff_strip_%d.jpg", rev)
-				var stripAsset string
-				if preview.BuildFilmstrip(pctx, ffBin, filePath, probe.DurationSec, 8, 96, 54, filepath.Join(assetsDir, sName)) == nil {
-					stripAsset = sName
-				}
-				if pctx.Err() != nil {
-					return
-				}
-				a.mu.Lock()
-				if seq != a.probeSeq {
-					a.mu.Unlock()
-					return
-				}
-				a.state.StripAsset = stripAsset
-				a.state.FilmstripLoading = false
-				a.updateLoadingStageLocked()
-				t := RenderTree(a.state)
-				a.mu.Unlock()
-				a.renderTree(t, true)
-			}()
-		}
-
-		if needProxy {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				proxyName := fmt.Sprintf("ff_proxy_%d.mp4", rev)
-				perr := preview.BuildPlayableProxy(pctx, ffBin, filePath, probe, filepath.Join(assetsDir, proxyName))
-				if pctx.Err() != nil {
-					return
-				}
-				a.mu.Lock()
-				if seq != a.probeSeq {
-					a.mu.Unlock()
-					return
-				}
-				a.state.ProxyLoading = false
-				if perr == nil {
-					a.state.ProxyAsset = proxyName
-					a.state.VideoErr = ""
-					if a.state.VideoLoadWaiting {
-						a.armVideoReadyFallbackLocked(seq)
-					}
-				} else {
-					a.state.VideoLoadWaiting = false
-					a.state.VideoErr = "Preview proxy failed: " + perr.Error()
-				}
-				a.updateLoadingStageLocked()
-				t := RenderTree(a.state)
-				a.mu.Unlock()
-				a.renderTree(t, true)
-			}()
-		}
-
-		wg.Wait()
 	}()
 }
 
-func (a *App) startProxyBuildLocked(parentCtx context.Context, seq uint64, probe *engine.MediaProbe) {
-	if a.assetsDir == "" || !a.state.HasFFmpeg || probe == nil || a.state.ProxyLoading {
+func (a *App) startFilmstripBuildLocked(parentCtx context.Context, mode string, seq uint64, probe *engine.MediaProbe) {
+	m := normalizeMode(mode)
+	ms := a.state.SessionFor(m)
+	if a.assetsDir == "" || !a.state.HasFFmpeg || probe == nil || !probe.HasVideo() || probe.DurationSec <= 0 {
 		return
 	}
-	if a.proxyCancel != nil {
-		a.proxyCancel()
+	ctrl := a.workerCtrlLocked(m)
+	if ctrl.stripCancel != nil {
+		ctrl.stripCancel()
 	}
-	xctx, cancel := context.WithCancel(parentCtx)
-	a.proxyCancel = cancel
+	sctx, cancel := context.WithCancel(parentCtx)
+	ctrl.stripCancel = cancel
 	a.state.AssetRev++
 	rev := a.state.AssetRev
-	a.state.ProxyLoading = true
-	a.state.ProxyTried = true
-	a.state.VideoLoadWaiting = probe.HasVideo()
-	a.updateLoadingStageLocked()
+	ms.FilmstripLoading = true
+
+	ffBin := a.state.FFmpegPath
+	assetsDir := a.assetsDir
+	filePath := probe.Path
+	dur := probe.DurationSec
+	hwPlan := a.state.HWPlan
+	trackW := ComputeTrackWidth(a.state.ViewportW)
+	numTiles := clampIntRange(int(math.Round(float64(trackW)/110.0)), 8, 12)
+	tileW := maxInt(80, int(math.Round(float64(trackW)/float64(numTiles))))
+	const tileH = 54
+
+	go func() {
+		defer cancel()
+		sName := fmt.Sprintf("ff_%s_strip_%d.jpg", m, rev)
+		var stripAsset string
+		if preview.BuildFilmstripWithHW(sctx, ffBin, filePath, dur, numTiles, tileW, tileH, hwPlan, filepath.Join(assetsDir, sName)) == nil {
+			stripAsset = sName
+		}
+		if sctx.Err() != nil {
+			return
+		}
+		a.mu.Lock()
+		c2 := a.workerCtrlLocked(m)
+		if seq != c2.probeSeq {
+			a.mu.Unlock()
+			return
+		}
+		ms2 := a.state.SessionFor(m)
+		ms2.StripAsset = stripAsset
+		ms2.FilmstripLoading = false
+		t := RenderTree(a.state)
+		a.mu.Unlock()
+		a.renderTree(t, true)
+	}()
+}
+
+func (a *App) activatePreviewLocked(parentCtx context.Context, mode string) {
+	m := normalizeMode(mode)
+	if a.state.VideoPreviewMode == VideoPreviewOff {
+		return
+	}
+	ms := a.state.SessionFor(m)
+	if ms.Probe == nil {
+		return
+	}
+	ms.PreviewLoaded = true
+	ms.VideoErr = ""
+	ms.ProxyRequired = false
+	ms.ProxyReason = ""
+	if ms.ProxyAsset != "" || ms.TryNativeOverride || !preview.NeedsPreviewProxy(ms.Probe) || a.assetsDir == "" || !a.state.HasFFmpeg {
+		return
+	}
+	ctrl := a.workerCtrlLocked(m)
+	switch a.state.PreviewProxyPolicy {
+	case ProxyPolicyOff:
+		return
+	case ProxyPolicyAuto:
+		a.startProxyBuildLocked(parentCtx, m, ctrl.probeSeq, ms.Probe)
+	case ProxyPolicyRemuxOnly:
+		if preview.CanFastRemuxProxy(ms.Probe) {
+			a.startProxyBuildLocked(parentCtx, m, ctrl.probeSeq, ms.Probe)
+		} else {
+			ms.ProxyRequired = true
+			ms.ProxyReason = describeProxyRequirement(ms.Probe)
+		}
+	case ProxyPolicyManual:
+		ms.ProxyRequired = true
+		ms.ProxyReason = describeProxyRequirement(ms.Probe)
+	}
+}
+
+func describeProxyRequirement(probe *engine.MediaProbe) string {
+	if probe == nil {
+		return "This format needs a lightweight MP4 preview proxy for OS playback."
+	}
+	ext := strings.ToUpper(strings.TrimPrefix(filepath.Ext(probe.Path), "."))
+	if ext == "" {
+		ext = "Media"
+	}
+	if probe.SizeBytes > preview.MaxRemuxProxyBytes {
+		return fmt.Sprintf("%s (%s) exceeds the 240 MB fast-remux limit. Build a fast 480p proxy or export directly.", ext, formatBytesHuman(probe.SizeBytes))
+	}
+	if probe.HasVideo() {
+		vc := strings.ToUpper(probe.VideoStreams[0].Codec)
+		return fmt.Sprintf("%s (%s) needs a 480p H.264 preview proxy for smooth playback. You can still configure and export immediately.", ext, vc)
+	}
+	return fmt.Sprintf("%s audio needs a quick AAC preview proxy, or you can export directly.", ext)
+}
+
+func (a *App) startProxyBuildLocked(parentCtx context.Context, mode string, seq uint64, probe *engine.MediaProbe) {
+	m := normalizeMode(mode)
+	ms := a.state.SessionFor(m)
+	if a.assetsDir == "" || !a.state.HasFFmpeg || probe == nil || ms.ProxyLoading {
+		return
+	}
+	ctrl := a.workerCtrlLocked(m)
+	if ctrl.proxyCancel != nil {
+		ctrl.proxyCancel()
+	}
+	xctx, cancel := context.WithCancel(parentCtx)
+	ctrl.proxyCancel = cancel
+	a.state.AssetRev++
+	rev := a.state.AssetRev
+	ms.ProxyRequired = false
+	ms.ProxyReason = ""
+	ms.ProxyLoading = true
+	ms.ProxyTried = true
+	hwPlan := a.state.HWPlan
+	switch {
+	case !probe.HasVideo():
+		ms.ProxyStage = "Preparing audio preview…"
+	case preview.CanFastRemuxProxy(probe):
+		ms.ProxyStage = "Remuxing container for preview…"
+	case hwPlan.Active():
+		ms.ProxyStage = "Building 480p GPU preview proxy…"
+	default:
+		ms.ProxyStage = "Building 480p preview proxy…"
+	}
 	ffBin := a.state.FFmpegPath
 	assetsDir := a.assetsDir
 	filePath := probe.Path
 
 	go func() {
 		defer cancel()
-		proxyName := fmt.Sprintf("ff_proxy_%d.mp4", rev)
-		err := preview.BuildPlayableProxy(xctx, ffBin, filePath, probe, filepath.Join(assetsDir, proxyName))
+		proxyName := fmt.Sprintf("ff_%s_proxy_%d.mp4", m, rev)
+		err := preview.BuildPlayableProxyWithHW(xctx, ffBin, filePath, probe, hwPlan, filepath.Join(assetsDir, proxyName))
 		if xctx.Err() != nil {
 			return
 		}
 		a.mu.Lock()
-		if seq != a.probeSeq {
+		c2 := a.workerCtrlLocked(m)
+		if seq != c2.probeSeq {
 			a.mu.Unlock()
 			return
 		}
-		a.state.ProxyLoading = false
+		ms2 := a.state.SessionFor(m)
+		ms2.ProxyLoading = false
+		ms2.ProxyStage = ""
 		if err == nil {
-			a.state.ProxyAsset = proxyName
-			a.state.VideoErr = ""
-			if a.state.VideoLoadWaiting {
-				a.armVideoReadyFallbackLocked(seq)
-			}
+			ms2.ProxyAsset = proxyName
+			ms2.ProxyRequired = false
+			ms2.ProxyReason = ""
+			ms2.VideoErr = ""
 		} else {
-			a.state.VideoLoadWaiting = false
+			ms2.ProxyRequired = true
+			ms2.ProxyReason = "Preview proxy failed: " + err.Error()
+			ms2.VideoErr = ms2.ProxyReason
 		}
-		a.updateLoadingStageLocked()
 		t := RenderTree(a.state)
 		a.mu.Unlock()
 		a.renderTree(t, true)
@@ -1278,44 +1756,47 @@ func (a *App) startProxyBuildLocked(parentCtx context.Context, seq uint64, probe
 
 func (a *App) addCurrentClipLocked() {
 	s := &a.state
-	if s.Probe == nil || s.EndSec <= s.StartSec {
+	ms := s.ActiveSession()
+	if ms.Probe == nil || ms.EndSec <= ms.StartSec {
 		return
 	}
-	s.NextClipID++
-	s.Clips = append(s.Clips, engine.ClipSegment{
-		ID:       fmt.Sprintf("c%d", s.NextClipID),
-		Title:    fmt.Sprintf("Clip %d", s.NextClipID),
-		StartSec: s.StartSec,
-		EndSec:   s.EndSec,
+	ms.NextClipID++
+	ms.Clips = append(ms.Clips, engine.ClipSegment{
+		ID:       fmt.Sprintf("c%d", ms.NextClipID),
+		Title:    fmt.Sprintf("Clip %d", ms.NextClipID),
+		StartSec: ms.StartSec,
+		EndSec:   ms.EndSec,
 	})
-	s.StatusMsg = fmt.Sprintf("Added Clip %d (%s–%s)", s.NextClipID, FormatTimestamp(s.StartSec), FormatTimestamp(s.EndSec))
+	s.StatusMsg = fmt.Sprintf("Added Clip %d (%s–%s)", ms.NextClipID, FormatTimestamp(ms.StartSec), FormatTimestamp(ms.EndSec))
 }
 
 func (a *App) splitChaptersLocked() {
 	s := &a.state
-	if s.Probe == nil || len(s.Probe.Chapters) == 0 {
+	ms := s.ActiveSession()
+	if ms.Probe == nil || len(ms.Probe.Chapters) == 0 {
 		return
 	}
-	s.Clips = nil
-	for i, ch := range s.Probe.Chapters {
-		s.NextClipID++
+	ms.Clips = nil
+	for i, ch := range ms.Probe.Chapters {
+		ms.NextClipID++
 		end := ch.EndSec
 		if end <= ch.StartSec {
-			end = s.Probe.DurationSec
+			end = ms.Probe.DurationSec
 		}
-		s.Clips = append(s.Clips, engine.ClipSegment{
-			ID:       fmt.Sprintf("ch%d_%d", i+1, s.NextClipID),
+		ms.Clips = append(ms.Clips, engine.ClipSegment{
+			ID:       fmt.Sprintf("ch%d_%d", i+1, ms.NextClipID),
 			Title:    ch.Title,
 			StartSec: ch.StartSec,
 			EndSec:   end,
 		})
 	}
-	s.StatusMsg = fmt.Sprintf("Split %d chapters into cut list", len(s.Clips))
+	s.StatusMsg = fmt.Sprintf("Split %d chapters into cut list", len(ms.Clips))
 }
 
-func (a *App) saveHDFrameAsync(ctx context.Context, sec float64, tag string) {
+func (a *App) saveHDFrameAsync(ctx context.Context, mode string, sec float64, tag string) {
 	a.mu.Lock()
-	if !a.state.HasFFmpeg || a.state.Probe == nil {
+	ms := a.state.SessionFor(mode)
+	if !a.state.HasFFmpeg || ms.Probe == nil {
 		a.state.ErrorMsg = "FFmpeg and a loaded video are required for HD snapshots."
 		t := RenderTree(a.state)
 		a.mu.Unlock()
@@ -1323,7 +1804,7 @@ func (a *App) saveHDFrameAsync(ctx context.Context, sec float64, tag string) {
 		return
 	}
 	ffBin := a.state.FFmpegPath
-	filePath := a.state.Probe.Path
+	filePath := ms.Probe.Path
 	outDir := a.state.OutputDir
 	if outDir == "" {
 		outDir = expandHome("~/Downloads")
@@ -1360,7 +1841,7 @@ func (a *App) enqueueCurrent(ctx context.Context, startNow bool) {
 		a.renderTree(t, true)
 		return
 	}
-	plan, err := engine.BuildCommandPlan(spec, a.state.Probe)
+	plan, err := engine.BuildCommandPlan(spec, a.state.CurrentSession().Probe)
 	if err != nil {
 		a.state.ErrorMsg = err.Error()
 		t := RenderTree(a.state)
@@ -1428,7 +1909,7 @@ func (a *App) renderTree(tree pluginapi.UITree, force bool) {
 	_ = sess.Render(tree)
 }
 
-func applyMediaTelemetry(s *State, raw string) {
+func applyMediaTelemetry(ms *ModeSession, mode, raw string) {
 	for _, part := range strings.Split(raw, "|") {
 		k, v, ok := strings.Cut(part, "=")
 		if !ok {
@@ -1437,18 +1918,35 @@ func applyMediaTelemetry(s *State, raw string) {
 		switch k {
 		case "pos":
 			if f, err := strconv.ParseFloat(v, 64); err == nil && f >= 0 {
-				s.PlayheadSec = f
+				if modeUsesTrimRange(mode) && ms.EndSec > ms.StartSec {
+					if f < ms.StartSec {
+						f = ms.StartSec
+					} else if f > ms.EndSec {
+						f = ms.EndSec
+					}
+				}
+				ms.PlayheadSec = f
 			}
 		case "playing":
-			s.IsPlaying = v == "1"
+			ms.IsPlaying = v == "1"
 		case "ended":
-			s.PlayEnded = v == "1"
+			ms.PlayEnded = v == "1"
 		case "ready":
-			s.VideoReady = v == "1"
+			ms.VideoReady = v == "1"
 		case "err":
-			s.VideoErr = v
+			ms.VideoErr = v
 		}
 	}
+}
+
+func clampIntRange(v, minV, maxV int) int {
+	if v < minV {
+		return minV
+	}
+	if v > maxV {
+		return maxV
+	}
+	return v
 }
 
 func nextPlaybackRate(cur float64) float64 {

@@ -1,2 +1,4 @@
 github.com/seiortech/mtools-sdk v0.2.5 h1:9uCK4Wo3G5ZsHm8Axy9B7m3oGLWOxOODPMH7kCOxpXo=
 github.com/seiortech/mtools-sdk v0.2.5/go.mod h1:un70tBvIpmdNd7fID+wTphhhTEP6JxdEK9OPw7rKmJ4=
+github.com/seiortech/mtools-sdk v0.2.9-0.20261123070128-e27e8267983d h1:lg9MwwMBuB6l9zsB3XjwEeUyb3BhDBocDW5y3lN9JwM=
+github.com/seiortech/mtools-sdk v0.2.9-0.20261123070128-e27e8267983d/go.mod h1:un70tBvIpmdNd7fID+wTphhhTEP6JxdEK9OPw7rKmJ4=

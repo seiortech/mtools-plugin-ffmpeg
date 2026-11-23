@@ -68,3 +68,51 @@ func TestJobCancelCleansPartialFile(t *testing.T) {
 		t.Fatalf("expected partial file %s to be removed on cancel", partFile)
 	}
 }
+
+func TestJobRunFallsBackToCPUOnHardwareFailure(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script fixture uses sh")
+	}
+	tmp := t.TempDir()
+	fakeFF := filepath.Join(tmp, "ffmpeg")
+	outFile := filepath.Join(tmp, "out.mp4")
+	partFile := tempPathFor(outFile)
+
+	// Fail when invoked with -hwaccel, succeed on CPU fallback.
+	script := "#!/bin/sh\nfor a in \"$@\"; do\n  if [ \"$a\" = \"-hwaccel\" ]; then\n    echo 'hw init failed' >&2\n    exit 1\n  fi\ndone\ntouch \"" + partFile + "\"\necho 'progress=end'\nexit 0\n"
+	if err := os.WriteFile(fakeFF, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	job := Job{
+		FFmpegPath: fakeFF,
+		Plan: CommandPlan{
+			Steps: []CommandStep{{
+				Args:         []string{"-hwaccel", "videotoolbox", partFile},
+				FallbackArgs: []string{"-c:v", "libx264", partFile},
+				TempOutput:   partFile,
+				FinalOutput:  outFile,
+				DurationSec:  10,
+			}},
+			Summary: "done",
+		},
+	}
+
+	res, err := job.Run(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("expected CPU fallback to succeed, got %v", err)
+	}
+	if len(res.Outputs) != 1 || res.Outputs[0] != outFile {
+		t.Fatalf("unexpected outputs: %+v", res.Outputs)
+	}
+	if _, statErr := os.Stat(outFile); statErr != nil {
+		t.Fatalf("expected final output %s on disk: %v", outFile, statErr)
+	}
+
+	// Canceled context must NOT retry on CPU fallback.
+	cctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, cerr := job.Run(cctx, nil); !errors.Is(cerr, context.Canceled) {
+		t.Fatalf("expected context.Canceled without fallback, got %v", cerr)
+	}
+}

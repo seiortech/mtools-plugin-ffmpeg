@@ -76,6 +76,28 @@ func (j Job) Run(ctx context.Context, onProgress func(pluginapi.Progress)) (plug
 		}
 
 		err := j.runStep(ctx, args, step, i, totalSteps, onProgress)
+		if err != nil && ctx.Err() == nil && len(step.FallbackArgs) > 0 {
+			if step.MultiOutputDir == "" && step.TempOutput != "" {
+				_ = os.Remove(step.TempOutput)
+			}
+			if onProgress != nil {
+				onProgress(pluginapi.Progress{
+					Done:    (float64(i) * 100) / float64(totalSteps),
+					Total:   100,
+					Unit:    "%",
+					Message: "Hardware acceleration failed — retrying on CPU…",
+				})
+			}
+			fbArgs := append([]string(nil), step.FallbackArgs...)
+			if concatFile != "" && step.ConcatInputPlaceholder != "" {
+				for k := range fbArgs {
+					if fbArgs[k] == step.ConcatInputPlaceholder {
+						fbArgs[k] = concatFile
+					}
+				}
+			}
+			err = j.runStep(ctx, fbArgs, step, i, totalSteps, onProgress)
+		}
 		if concatFile != "" {
 			_ = os.Remove(concatFile)
 		}

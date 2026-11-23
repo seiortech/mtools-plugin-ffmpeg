@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 
 	"github.com/seiortech/mtools-plugin-ffmpeg/internal/engine"
 	"github.com/seiortech/mtools-plugin-ffmpeg/internal/liveui"
@@ -102,11 +103,16 @@ func (r *ffRunner) Run(ctx context.Context, params pluginapi.RunParams, emit fun
 		if outDir == "" {
 			outDir = params.Settings["output_dir"]
 		}
+		hwMode := engine.NormalizeHWAccelMode(params.Settings["hardware_accel"])
+		hwBackend := engine.NormalizeHWBackend(params.Settings["hardware_backend"])
+		hwCaps := engine.ProbeHWCapabilities(ctx, ffPath)
+		hwPlan := engine.ResolveHWPlan(hwMode, hwBackend, hwCaps, runtime.GOOS)
 		spec := engine.JobSpec{
 			ID:         params.JobID,
 			Mode:       engine.ModeConvert,
 			InputPaths: []string{inFile},
 			OutputDir:  outDir,
+			HW:         hwPlan,
 			Opts: engine.TranscodeOptions{
 				Container:  params.Settings["default_container"],
 				VideoCodec: "libx264",

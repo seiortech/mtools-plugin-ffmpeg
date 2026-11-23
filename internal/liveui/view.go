@@ -15,9 +15,10 @@ var mediaExtensions = []string{"mp4", "mkv", "mov", "webm", "avi", "m4v", "ts", 
 
 // RenderTree builds the Video Editor Studio Bauhaus × Sage Garden UITree for the current State.
 func RenderTree(s State) pluginapi.UITree {
+	ms := s.CurrentSession()
 	rootChildren := make([]pluginapi.UINode, 0, 6)
 
-	rootChildren = append(rootChildren, renderTopBar(s))
+	rootChildren = append(rootChildren, renderTopBar(s, ms))
 
 	if !s.HasFFmpeg {
 		rootChildren = append(rootChildren, renderNeedBanner(
@@ -30,8 +31,8 @@ func RenderTree(s State) pluginapi.UITree {
 
 	if s.ErrorMsg != "" {
 		rootChildren = append(rootChildren, renderBanner("err_banner", s.ErrorMsg, "danger"))
-	} else if s.ProbeError != "" {
-		rootChildren = append(rootChildren, renderBanner("probe_err_banner", s.ProbeError, "danger"))
+	} else if ms.ProbeError != "" {
+		rootChildren = append(rootChildren, renderBanner("probe_err_banner", ms.ProbeError, "danger"))
 	} else if s.StatusMsg != "" {
 		rootChildren = append(rootChildren, renderBanner("status_banner", s.StatusMsg, "field_support"))
 	}
@@ -63,17 +64,19 @@ func RenderTree(s State) pluginapi.UITree {
 			ResetOnDoubleClick: true,
 		}),
 		Children: []pluginapi.UINode{
-			renderMonitorStage(s),
-			renderInspectorSidebar(s),
+			renderMonitorStage(s, ms),
+			renderInspectorSidebar(s, ms),
 		},
 	})
 
-	rootChildren = append(rootChildren, renderTimelineDeck(s))
+	if shouldShowBottomDeck(s, ms) {
+		rootChildren = append(rootChildren, renderTimelineDeck(s, ms))
+	}
 
-	if s.IsMediaLoading() {
-		rootChildren = append(rootChildren, renderLoadingModal(s))
-	} else if s.FullscreenOpen && s.Probe != nil && s.Probe.HasVideo() {
-		rootChildren = append(rootChildren, renderFullscreenDialog(s))
+	if ms.IsMediaLoading() {
+		rootChildren = append(rootChildren, renderLoadingModal(ms))
+	} else if s.FullscreenOpen && ms.Probe != nil && ms.Probe.HasVideo() && ms.PreviewLoaded && !ms.ProxyLoading && !ms.ProxyRequired && s.VideoPreviewMode != VideoPreviewOff {
+		rootChildren = append(rootChildren, renderFullscreenDialog(s, ms))
 	}
 
 	return pluginapi.UITree{
@@ -91,7 +94,7 @@ func RenderTree(s State) pluginapi.UITree {
 	}
 }
 
-func renderTopBar(s State) pluginapi.UINode {
+func renderTopBar(s State, ms ModeSession) pluginapi.UINode {
 	modeTabs := pluginapi.UINode{
 		ID:   "mode_tabs",
 		Kind: pluginapi.UINodeTabs,
@@ -119,19 +122,19 @@ func renderTopBar(s State) pluginapi.UINode {
 	}
 
 	var titleKids []pluginapi.UINode
-	if s.Probe != nil {
-		metaLine := formatProbeMetaLine(s.Probe)
+	if ms.Probe != nil {
+		metaLine := formatProbeMetaLine(ms.Probe)
 		titleKids = []pluginapi.UINode{
 			{
 				ID:   "summary_title",
 				Kind: pluginapi.UINodeText,
 				Props: mustProps(pluginapi.UITextProps{
-					Text:       filepath.Base(s.Probe.Path),
+					Text:       filepath.Base(ms.Probe.Path),
 					FontSize:   13,
 					FontWeight: 700,
 					Align:      "center",
 					SingleLine: true,
-					Tooltip:    s.Probe.Path + " · " + metaLine,
+					Tooltip:    ms.Probe.Path + " · " + metaLine,
 				}),
 			},
 			{
@@ -174,11 +177,89 @@ func renderTopBar(s State) pluginapi.UINode {
 		Children: titleKids,
 	}
 
-	hasInput := len(s.InputFiles) > 0 && s.HasFFmpeg
+	hasInput := len(ms.InputFiles) > 0 && s.HasFFmpeg
 	toggleIcon := "collapse-right"
 	if s.RailCollapsed {
 		toggleIcon = "collapse-left"
 	}
+
+	rightKids := []pluginapi.UINode{
+		{
+			ID:   "btn_pick_media",
+			Kind: pluginapi.UINodeButton,
+			Props: mustProps(pluginapi.UIButtonProps{
+				Label:    "Add Media",
+				Icon:     "plus",
+				Variant:  "secondary",
+				Height:   30,
+				PaddingX: 10,
+				PaddingY: 4,
+				PickFile: &pluginapi.UIFilePickerProps{
+					Label:      "Select Media Files",
+					Mode:       "open",
+					Multiple:   true,
+					Extensions: mediaExtensions,
+				},
+			}),
+		},
+		{
+			ID:   "btn_add_queue",
+			Kind: pluginapi.UINodeButton,
+			Props: mustProps(pluginapi.UIButtonProps{
+				Label:    "+ Queue",
+				Variant:  "secondary",
+				Height:   30,
+				PaddingX: 10,
+				PaddingY: 4,
+				Disabled: !hasInput,
+			}),
+		},
+		{
+			ID:   "btn_export",
+			Kind: pluginapi.UINodeButton,
+			Props: mustProps(pluginapi.UIButtonProps{
+				Label:    "Export",
+				Variant:  "primary",
+				Height:   30,
+				PaddingX: 12,
+				PaddingY: 4,
+				Disabled: !hasInput,
+			}),
+		},
+	}
+	if shouldShowBottomDeck(s, ms) {
+		deckIcon := "chevron-down"
+		deckTip := "Hide Player Deck"
+		if s.DeckCollapsed {
+			deckIcon = "chevron-up"
+			deckTip = "Show Player Deck"
+		}
+		rightKids = append(rightKids, pluginapi.UINode{
+			ID:   "btn_top_deck_toggle",
+			Kind: pluginapi.UINodeButton,
+			Props: mustProps(pluginapi.UIButtonProps{
+				Icon:     deckIcon,
+				IconOnly: true,
+				Variant:  "secondary",
+				Selected: !s.DeckCollapsed,
+				Width:    30,
+				Height:   30,
+				Tooltip:  deckTip,
+			}),
+		})
+	}
+	rightKids = append(rightKids, pluginapi.UINode{
+		ID:   "btn_rail_toggle",
+		Kind: pluginapi.UINodeButton,
+		Props: mustProps(pluginapi.UIButtonProps{
+			Icon:     toggleIcon,
+			IconOnly: true,
+			Variant:  "secondary",
+			Width:    30,
+			Height:   30,
+			Tooltip:  "Toggle Inspector Sidebar",
+		}),
+	})
 
 	rightControls := pluginapi.UINode{
 		ID:   "topbar_right",
@@ -188,62 +269,7 @@ func renderTopBar(s State) pluginapi.UINode {
 			Align:       "center",
 			NoFillWidth: true,
 		}),
-		Children: []pluginapi.UINode{
-			{
-				ID:   "btn_pick_media",
-				Kind: pluginapi.UINodeButton,
-				Props: mustProps(pluginapi.UIButtonProps{
-					Label:    "Add Media",
-					Icon:     "plus",
-					Variant:  "secondary",
-					Height:   30,
-					PaddingX: 10,
-					PaddingY: 4,
-					PickFile: &pluginapi.UIFilePickerProps{
-						Label:      "Select Media Files",
-						Mode:       "open",
-						Multiple:   true,
-						Extensions: mediaExtensions,
-					},
-				}),
-			},
-			{
-				ID:   "btn_add_queue",
-				Kind: pluginapi.UINodeButton,
-				Props: mustProps(pluginapi.UIButtonProps{
-					Label:    "+ Queue",
-					Variant:  "secondary",
-					Height:   30,
-					PaddingX: 10,
-					PaddingY: 4,
-					Disabled: !hasInput,
-				}),
-			},
-			{
-				ID:   "btn_export",
-				Kind: pluginapi.UINodeButton,
-				Props: mustProps(pluginapi.UIButtonProps{
-					Label:    "Export",
-					Variant:  "primary",
-					Height:   30,
-					PaddingX: 12,
-					PaddingY: 4,
-					Disabled: !hasInput,
-				}),
-			},
-			{
-				ID:   "btn_rail_toggle",
-				Kind: pluginapi.UINodeButton,
-				Props: mustProps(pluginapi.UIButtonProps{
-					Icon:     toggleIcon,
-					IconOnly: true,
-					Variant:  "secondary",
-					Width:    30,
-					Height:   30,
-					Tooltip:  "Toggle Inspector Sidebar",
-				}),
-			},
-		},
+		Children: rightKids,
 	}
 
 	return pluginapi.UINode{
@@ -283,20 +309,20 @@ func formatProbeMetaLine(p *engine.MediaProbe) string {
 	return strings.Join(parts, " · ")
 }
 
-func renderLoadingModal(s State) pluginapi.UINode {
-	done := s.LoadingPct
+func renderLoadingModal(ms ModeSession) pluginapi.UINode {
+	done := ms.LoadingPct
 	if done < 0 {
 		done = 0
 	} else if done > 100 {
 		done = 100
 	}
-	stage := nonEmptyStr(s.LoadingStage, "Preparing media…")
+	stage := nonEmptyStr(ms.LoadingStage, "Preparing media…")
 	return pluginapi.UINode{
 		ID:   "loading_modal",
 		Kind: pluginapi.UINodeDialog,
 		Props: mustProps(pluginapi.UIDialogProps{
 			Title:       "Loading media…",
-			Subtitle:    s.LoadingFile,
+			Subtitle:    ms.LoadingFile,
 			Open:        true,
 			Blocking:    true,
 			Width:       420,
@@ -402,15 +428,272 @@ func renderBanner(id, msg, surface string) pluginapi.UINode {
 	}
 }
 
-func renderMonitorStage(s State) pluginapi.UINode {
+func modeEmptyCopy(mode string) (string, string) {
+	switch normalizeMode(mode) {
+	case engine.ModeTrim:
+		return "Trim & Merge", "Load a video or audio file to set IN/OUT cuts on the filmstrip, or add multiple files to merge."
+	case engine.ModeStreams:
+		return "Audio & Subs", "Load a media file to swap audio tracks, normalize loudness, mux or burn subtitles, and edit metadata."
+	case engine.ModeFrames:
+		return "GIF & Frames", "Load a video to pick a scene range and export animated GIF/WebP, image sequences, or contact sheets."
+	default:
+		return "Convert & Compress", "Load a video or audio file to preview playback and convert formats, codecs, or target file size."
+	}
+}
+
+func shouldShowBottomDeck(s State, ms ModeSession) bool {
+	return ms.Probe != nil && (modeUsesTrimRange(s.Mode) || ms.PreviewLoaded)
+}
+
+func stageCardWidth(s State, stacked bool) int {
+	availW := maxInt(260, s.ViewportW-344)
+	if stacked {
+		availW = maxInt(240, s.ViewportW-44)
+	}
+	return minInt(460, availW)
+}
+
+func renderPreviewOffCard(ms ModeSession, w int) pluginapi.UINode {
+	return pluginapi.UINode{
+		ID:   "stage_preview_off",
+		Kind: pluginapi.UINodeColumn,
+		Props: mustProps(pluginapi.UIContainerProps{
+			Surface:     "paper",
+			BorderSize:  3,
+			BorderToken: "ink",
+			Shadow:      [2]int{5, 5},
+			Padding:     20,
+			Gap:         8,
+			Width:       w,
+			Align:       "center",
+		}),
+		Children: []pluginapi.UINode{
+			{
+				ID:   "stage_preview_off_title",
+				Kind: pluginapi.UINodeText,
+				Props: mustProps(pluginapi.UITextProps{
+					Text:       filepath.Base(ms.Probe.Path),
+					Variant:    "heading",
+					SingleLine: true,
+				}),
+			},
+			{
+				ID:   "stage_preview_off_meta",
+				Kind: pluginapi.UINodeText,
+				Props: mustProps(pluginapi.UITextProps{
+					Text:        formatProbeMetaLine(ms.Probe),
+					Variant:     "muted",
+					TabularNums: true,
+					Align:       "center",
+				}),
+			},
+			{
+				ID:   "stage_preview_off_hint",
+				Kind: pluginapi.UINodeText,
+				Props: mustProps(pluginapi.UITextProps{
+					Text:    "Video preview is turned off in Settings for instant loading. Configure options on the right and click Export.",
+					Variant: "muted",
+					Align:   "center",
+				}),
+			},
+		},
+	}
+}
+
+func renderPreviewDeferredCard(s State, ms ModeSession, w int) pluginapi.UINode {
+	return pluginapi.UINode{
+		ID:   "stage_preview_deferred",
+		Kind: pluginapi.UINodeColumn,
+		Props: mustProps(pluginapi.UIContainerProps{
+			Surface:     "paper",
+			BorderSize:  3,
+			BorderToken: "ink",
+			Shadow:      [2]int{5, 5},
+			Padding:     20,
+			Gap:         10,
+			Width:       w,
+			Align:       "center",
+		}),
+		Children: []pluginapi.UINode{
+			{
+				ID:   "stage_deferred_title",
+				Kind: pluginapi.UINodeText,
+				Props: mustProps(pluginapi.UITextProps{
+					Text:       filepath.Base(ms.Probe.Path),
+					Variant:    "heading",
+					SingleLine: true,
+				}),
+			},
+			{
+				ID:   "stage_deferred_meta",
+				Kind: pluginapi.UINodeText,
+				Props: mustProps(pluginapi.UITextProps{
+					Text:        formatProbeMetaLine(ms.Probe),
+					Variant:     "muted",
+					TabularNums: true,
+					Align:       "center",
+				}),
+			},
+			{
+				ID:   "stage_deferred_hint",
+				Kind: pluginapi.UINodeText,
+				Props: mustProps(pluginapi.UITextProps{
+					Text:    "Fast Load active — video player skipped until needed. You can export immediately or load the preview below.",
+					Variant: "muted",
+					Align:   "center",
+				}),
+			},
+			{
+				ID:   "btn_load_preview",
+				Kind: pluginapi.UINodeButton,
+				Props: mustProps(pluginapi.UIButtonProps{
+					Label:    "Load Video Preview",
+					Icon:     "play",
+					Variant:  "primary",
+					Disabled: !s.HasFFmpeg && ms.Probe == nil,
+				}),
+			},
+		},
+	}
+}
+
+func renderProxyBuildingCard(ms ModeSession, w int) pluginapi.UINode {
+	stage := nonEmptyStr(ms.ProxyStage, "Preparing preview proxy…")
+	return pluginapi.UINode{
+		ID:   "stage_proxy_building",
+		Kind: pluginapi.UINodeColumn,
+		Props: mustProps(pluginapi.UIContainerProps{
+			Surface:     "paper",
+			BorderSize:  3,
+			BorderToken: "ink",
+			Shadow:      [2]int{5, 5},
+			Padding:     20,
+			Gap:         12,
+			Width:       w,
+			Align:       "center",
+		}),
+		Children: []pluginapi.UINode{
+			{
+				ID:   "stage_proxy_title",
+				Kind: pluginapi.UINodeText,
+				Props: mustProps(pluginapi.UITextProps{
+					Text:       filepath.Base(ms.Probe.Path),
+					Variant:    "heading",
+					SingleLine: true,
+				}),
+			},
+			{
+				ID:   "stage_proxy_prog",
+				Kind: pluginapi.UINodeProgress,
+				Props: mustProps(pluginapi.UIProgressProps{
+					Done:  0,
+					Total: 0,
+					Label: stage,
+				}),
+			},
+			{
+				ID:   "btn_cancel_proxy",
+				Kind: pluginapi.UINodeButton,
+				Props: mustProps(pluginapi.UIButtonProps{
+					Label:   "Cancel Proxy",
+					Variant: "secondary",
+				}),
+			},
+		},
+	}
+}
+
+func renderProxyNeededCard(s State, ms ModeSession, w int) pluginapi.UINode {
+	reason := nonEmptyStr(ms.ProxyReason, "This format requires a lightweight MP4 preview proxy for OS playback.")
+	var actions []pluginapi.UINode
+	if s.PreviewProxyPolicy != ProxyPolicyOff {
+		actions = append(actions, pluginapi.UINode{
+			ID:   "btn_build_proxy",
+			Kind: pluginapi.UINodeButton,
+			Props: mustProps(pluginapi.UIButtonProps{
+				Label:    "Build 480p Proxy",
+				Icon:     "film",
+				Variant:  "primary",
+				Disabled: !s.HasFFmpeg,
+			}),
+		})
+	}
+	if ms.VideoErr == "" {
+		actions = append(actions, pluginapi.UINode{
+			ID:   "btn_try_native",
+			Kind: pluginapi.UINodeButton,
+			Props: mustProps(pluginapi.UIButtonProps{
+				Label:   "Try Native Player",
+				Variant: "secondary",
+			}),
+		})
+	}
+	actions = append(actions, pluginapi.UINode{
+		ID:   "btn_unload_preview",
+		Kind: pluginapi.UINodeButton,
+		Props: mustProps(pluginapi.UIButtonProps{
+			Label:   "Hide Preview",
+			Variant: "ghost",
+		}),
+	})
+
+	return pluginapi.UINode{
+		ID:   "stage_proxy_needed",
+		Kind: pluginapi.UINodeColumn,
+		Props: mustProps(pluginapi.UIContainerProps{
+			Surface:     "paper",
+			BorderSize:  3,
+			BorderToken: "ink",
+			Shadow:      [2]int{5, 5},
+			Padding:     20,
+			Gap:         10,
+			Width:       w,
+			Align:       "center",
+		}),
+		Children: []pluginapi.UINode{
+			{
+				ID:   "stage_proxy_need_title",
+				Kind: pluginapi.UINodeText,
+				Props: mustProps(pluginapi.UITextProps{
+					Text:       filepath.Base(ms.Probe.Path),
+					Variant:    "heading",
+					SingleLine: true,
+				}),
+			},
+			{
+				ID:   "stage_proxy_need_reason",
+				Kind: pluginapi.UINodeText,
+				Props: mustProps(pluginapi.UITextProps{
+					Text:    reason,
+					Variant: "muted",
+					Align:   "center",
+				}),
+			},
+			{
+				ID:   "stage_proxy_need_acts",
+				Kind: pluginapi.UINodeRow,
+				Props: mustProps(pluginapi.UIContainerProps{
+					Gap:     8,
+					Wrap:    true,
+					Align:   "center",
+					Justify: "center",
+				}),
+				Children: actions,
+			},
+		},
+	}
+}
+
+func renderMonitorStage(s State, ms ModeSession) pluginapi.UINode {
 	stacked := s.ViewportW > 0 && s.ViewportW < 680
 
-	if s.Probe == nil {
+	if ms.Probe == nil {
 		availW := maxInt(260, s.ViewportW-344)
 		if stacked {
 			availW = maxInt(240, s.ViewportW-44)
 		}
 		emptyW := minInt(420, availW)
+		emptyTitle, emptySub := modeEmptyCopy(s.Mode)
 		return pluginapi.UINode{
 			ID:   "monitor_stage",
 			Kind: pluginapi.UINodeColumn,
@@ -427,8 +710,8 @@ func renderMonitorStage(s State) pluginapi.UINode {
 					ID:   "stage_empty",
 					Kind: pluginapi.UINodeEmpty,
 					Props: mustProps(pluginapi.UIEmptyProps{
-						Title:       "FFmpeg Studio",
-						Subtitle:    "Load a video or audio file to preview playback, set IN/OUT cuts on the filmstrip, and convert or remux locally.",
+						Title:       emptyTitle,
+						Subtitle:    emptySub,
 						Icon:        "film",
 						IconSize:    36,
 						ActionLabel: "Select Media Files…",
@@ -447,7 +730,7 @@ func renderMonitorStage(s State) pluginapi.UINode {
 		}
 	}
 
-	p := s.Probe
+	p := ms.Probe
 	if !p.HasVideo() {
 		return pluginapi.UINode{
 			ID:   "monitor_stage",
@@ -460,12 +743,21 @@ func renderMonitorStage(s State) pluginapi.UINode {
 				Align:      "center",
 				Justify:    "center",
 			}),
-			Children: []pluginapi.UINode{renderAudioMonitorCard(s, 420)},
+			Children: []pluginapi.UINode{renderAudioMonitorCard(s, ms, 420)},
 		}
 	}
 
+	cardW := stageCardWidth(s, stacked)
 	var stageChild pluginapi.UINode
+	pad := 0
+	var align, justify string
 	switch {
+	case s.VideoPreviewMode == VideoPreviewOff:
+		stageChild = renderPreviewOffCard(ms, cardW)
+		pad, align, justify = 20, "center", "center"
+	case !ms.PreviewLoaded:
+		stageChild = renderPreviewDeferredCard(s, ms, cardW)
+		pad, align, justify = 20, "center", "center"
 	case s.FullscreenOpen:
 		stageChild = pluginapi.UINode{
 			ID:   "video_fs_placeholder",
@@ -488,34 +780,18 @@ func renderMonitorStage(s State) pluginapi.UINode {
 				},
 			},
 		}
-	case s.ProxyLoading && s.ProxyAsset == "":
-		stageChild = pluginapi.UINode{
-			ID:   "video_proxy_wait",
-			Kind: pluginapi.UINodeColumn,
-			Props: mustProps(pluginapi.UIContainerProps{
-				Fill:    !stacked,
-				Height:  240,
-				Surface: "ground",
-				Align:   "center",
-				Justify: "center",
-			}),
-			Children: []pluginapi.UINode{
-				{
-					ID:   "video_proxy_wait_txt",
-					Kind: pluginapi.UINodeText,
-					Props: mustProps(pluginapi.UITextProps{
-						Text:    "Preparing playable video preview…",
-						Variant: "muted",
-					}),
-				},
-			},
-		}
+	case ms.ProxyLoading && ms.ProxyAsset == "":
+		stageChild = renderProxyBuildingCard(ms, cardW)
+		pad, align, justify = 20, "center", "center"
+	case ms.ProxyRequired && ms.ProxyAsset == "" && !ms.TryNativeOverride:
+		stageChild = renderProxyNeededCard(s, ms, cardW)
+		pad, align, justify = 20, "center", "center"
 	default:
 		if stacked {
 			vidH := minInt(360, maxInt(220, (s.ViewportW*9)/16))
-			stageChild = buildVideoPlayerNode(s, 0, vidH, false)
+			stageChild = buildVideoPlayerNode(s, ms, 0, vidH, false)
 		} else {
-			stageChild = buildVideoPlayerNode(s, 0, 0, true)
+			stageChild = buildVideoPlayerNode(s, ms, 0, 0, true)
 		}
 	}
 
@@ -526,31 +802,40 @@ func renderMonitorStage(s State) pluginapi.UINode {
 			Surface:    "ground",
 			Grow:       !stacked,
 			FillHeight: !stacked,
-			Padding:    0,
+			Padding:    pad,
 			Gap:        0,
+			Align:      align,
+			Justify:    justify,
 		}),
 		Children: []pluginapi.UINode{stageChild},
 	}
 }
 
-func buildVideoPlayerNode(s State, w, h int, fill bool) pluginapi.UINode {
-	src := "file:" + s.Probe.Path
-	if s.ProxyAsset != "" {
-		src = "asset:" + s.ProxyAsset
+func buildVideoPlayerNode(s State, ms ModeSession, w, h int, fill bool) pluginapi.UINode {
+	src := "file:" + ms.Probe.Path
+	if ms.ProxyAsset != "" {
+		src = "asset:" + ms.ProxyAsset
 	}
-	vol := s.Volume
-	rate := s.PlaybackRate
+	vol := ms.Volume
+	rate := ms.PlaybackRate
 	if rate <= 0 {
 		rate = 1.0
 	}
+	var loop bool
 	var loopStart, loopEnd float64
-	if s.LoopSelection && s.EndSec > s.StartSec {
-		loopStart = s.StartSec
-		loopEnd = s.EndSec
+	var clampStart, clampEnd float64
+	if modeUsesTrimRange(s.Mode) && ms.EndSec > ms.StartSec {
+		clampStart = ms.StartSec
+		clampEnd = ms.EndSec
+		if ms.LoopSelection {
+			loop = true
+			loopStart = ms.StartSec
+			loopEnd = ms.EndSec
+		}
 	}
 	poster := ""
-	if s.PosterAsset != "" {
-		poster = "asset:" + s.PosterAsset
+	if ms.PosterAsset != "" {
+		poster = "asset:" + ms.PosterAsset
 	}
 
 	return pluginapi.UINode{
@@ -558,29 +843,47 @@ func buildVideoPlayerNode(s State, w, h int, fill bool) pluginapi.UINode {
 		Kind: pluginapi.UINodeVideo,
 		Props: mustProps(pluginapi.UIVideoProps{
 			Src:        src,
-			Fit:        s.EffectiveVideoFit(),
+			Fit:        ms.EffectiveVideoFit(),
 			Surface:    "stage",
 			Width:      w,
 			Height:     h,
 			Fill:       fill,
 			Borderless: true,
-			Playing:    s.IsPlaying,
+			Playing:    ms.IsPlaying,
 			PlaySeq:    s.PlaySeq,
-			SeekSec:    s.SeekTargetSec,
+			SeekSec:    ms.SeekTargetSec,
 			SeekSeq:    s.SeekSeq,
 			Rate:       rate,
 			Volume:     &vol,
-			Muted:      s.Muted,
-			Loop:       s.LoopSelection,
+			Muted:      ms.Muted,
+			Loop:       loop,
 			LoopStart:  loopStart,
 			LoopEnd:    loopEnd,
+			ClampStart: clampStart,
+			ClampEnd:   clampEnd,
 			Poster:     poster,
 		}),
 	}
 }
 
-func renderAudioMonitorCard(s State, w int) pluginapi.UINode {
-	clipDur := maxFloat(0, s.EndSec-s.StartSec)
+func renderAudioMonitorCard(s State, ms ModeSession, w int) pluginapi.UINode {
+	if s.VideoPreviewMode == VideoPreviewOff {
+		return renderPreviewOffCard(ms, w)
+	}
+	if !ms.PreviewLoaded {
+		return renderPreviewDeferredCard(s, ms, w)
+	}
+	if ms.ProxyLoading && ms.ProxyAsset == "" {
+		return renderProxyBuildingCard(ms, w)
+	}
+	if ms.ProxyRequired && ms.ProxyAsset == "" && !ms.TryNativeOverride {
+		return renderProxyNeededCard(s, ms, w)
+	}
+	subText := fmt.Sprintf("Duration %s", FormatTimestamp(ms.Probe.DurationSec))
+	if modeUsesTrimRange(s.Mode) {
+		clipDur := maxFloat(0, ms.EndSec-ms.StartSec)
+		subText = fmt.Sprintf("IN %s → OUT %s (Clip %s)", FormatTimestamp(ms.StartSec), FormatTimestamp(ms.EndSec), FormatTimestamp(clipDur))
+	}
 	kids := []pluginapi.UINode{
 		{
 			ID:   "audio_card_title",
@@ -594,15 +897,15 @@ func renderAudioMonitorCard(s State, w int) pluginapi.UINode {
 			ID:   "audio_card_range",
 			Kind: pluginapi.UINodeText,
 			Props: mustProps(pluginapi.UITextProps{
-				Text:        fmt.Sprintf("IN %s → OUT %s (Clip %s)", FormatTimestamp(s.StartSec), FormatTimestamp(s.EndSec), FormatTimestamp(clipDur)),
+				Text:        subText,
 				Variant:     "muted",
 				TabularNums: true,
 			}),
 		},
 	}
 	// Keep a 1px video_player node mounted so OS audio playback works for audio-only files.
-	if s.Probe != nil && !s.FullscreenOpen {
-		vp := buildVideoPlayerNode(s, 1, 1, false)
+	if ms.Probe != nil && !s.FullscreenOpen {
+		vp := buildVideoPlayerNode(s, ms, 1, 1, false)
 		kids = append(kids, vp)
 	}
 	return pluginapi.UINode{
@@ -622,12 +925,96 @@ func renderAudioMonitorCard(s State, w int) pluginapi.UINode {
 	}
 }
 
-func renderFullscreenTransportRow(s State) pluginapi.UINode {
+func renderFullscreenTransportRow(s State, ms ModeSession) pluginapi.UINode {
 	dur := 0.0
-	if s.Probe != nil {
-		dur = s.Probe.DurationSec
+	if ms.Probe != nil {
+		dur = ms.Probe.DurationSec
 	}
-	playLabel, playIcon := playButtonState(s)
+	playLabel, playIcon := playButtonState(ms)
+	isTrim := modeUsesTrimRange(s.Mode)
+	kids := make([]pluginapi.UINode, 0, 10)
+	if isTrim {
+		kids = append(kids, pluginapi.UINode{
+			ID:   "fs_jump_in",
+			Kind: pluginapi.UINodeButton,
+			Props: mustProps(pluginapi.UIButtonProps{
+				Icon: "skip-back", IconOnly: true, Variant: "secondary", Width: 28, Height: 28,
+				Tooltip: "Jump to IN (Home)",
+			}),
+		})
+	}
+	kids = append(kids,
+		pluginapi.UINode{
+			ID:   "fs_skip_back",
+			Kind: pluginapi.UINodeButton,
+			Props: mustProps(pluginapi.UIButtonProps{
+				Label: "-5s", Variant: "secondary", Height: 28, PaddingX: 7, PaddingY: 3,
+				Tooltip: "Back 5 seconds (J)",
+			}),
+		},
+		pluginapi.UINode{
+			ID:   "fs_play_pause",
+			Kind: pluginapi.UINodeButton,
+			Props: mustProps(pluginapi.UIButtonProps{
+				Label: playLabel, Icon: playIcon, Variant: "primary", Height: 30, PaddingX: 12, PaddingY: 4,
+				Tooltip: "Play / Pause / Resume (Space or K)",
+			}),
+		},
+		pluginapi.UINode{
+			ID:   "fs_skip_fwd",
+			Kind: pluginapi.UINodeButton,
+			Props: mustProps(pluginapi.UIButtonProps{
+				Label: "+5s", Variant: "secondary", Height: 28, PaddingX: 7, PaddingY: 3,
+				Tooltip: "Forward 5 seconds (L)",
+			}),
+		},
+	)
+	if isTrim {
+		kids = append(kids, pluginapi.UINode{
+			ID:   "fs_jump_out",
+			Kind: pluginapi.UINodeButton,
+			Props: mustProps(pluginapi.UIButtonProps{
+				Icon: "skip-forward", IconOnly: true, Variant: "secondary", Width: 28, Height: 28,
+				Tooltip: "Jump to OUT (End)",
+			}),
+		})
+	}
+	kids = append(kids, pluginapi.UINode{
+		ID:   "fs_timecode",
+		Kind: pluginapi.UINodeText,
+		Props: mustProps(pluginapi.UITextProps{
+			Text:          fmt.Sprintf("%s / %s", FormatTimecodePrecise(ms.PlayheadSec), FormatTimecodePrecise(dur)),
+			Variant:       "body",
+			TabularNums:   true,
+			FontWeight:    600,
+			BindVideoTime: "video_player",
+			BindDuration:  dur,
+		}),
+	})
+	if isTrim {
+		kids = append(kids,
+			pluginapi.UINode{
+				ID:    "fs_mark_in",
+				Kind:  pluginapi.UINodeButton,
+				Props: mustProps(pluginapi.UIButtonProps{Label: "[ IN", Variant: "secondary"}),
+			},
+			pluginapi.UINode{
+				ID:    "fs_mark_out",
+				Kind:  pluginapi.UINodeButton,
+				Props: mustProps(pluginapi.UIButtonProps{Label: "OUT ]", Variant: "secondary"}),
+			},
+			pluginapi.UINode{
+				ID:    "fs_loop_toggle",
+				Kind:  pluginapi.UINodeButton,
+				Props: mustProps(pluginapi.UIButtonProps{Label: "Loop", Icon: "repeat", Variant: "secondary", Selected: ms.LoopSelection}),
+			},
+		)
+	}
+	kids = append(kids, pluginapi.UINode{
+		ID:    "fs_snapshot_hd",
+		Kind:  pluginapi.UINodeButton,
+		Props: mustProps(pluginapi.UIButtonProps{Label: "HD", Icon: "camera", Variant: "secondary", Disabled: !s.HasFFmpeg}),
+	})
 	return pluginapi.UINode{
 		ID:   "fs_transport_row",
 		Kind: pluginapi.UINodeRow,
@@ -637,97 +1024,24 @@ func renderFullscreenTransportRow(s State) pluginapi.UINode {
 			Justify: "center",
 			Wrap:    true,
 		}),
-		Children: []pluginapi.UINode{
-			{
-				ID:   "fs_jump_in",
-				Kind: pluginapi.UINodeButton,
-				Props: mustProps(pluginapi.UIButtonProps{
-					Icon: "skip-back", IconOnly: true, Variant: "secondary", Width: 28, Height: 28,
-					Tooltip: "Jump to IN / Start (Home)",
-				}),
-			},
-			{
-				ID:   "fs_skip_back",
-				Kind: pluginapi.UINodeButton,
-				Props: mustProps(pluginapi.UIButtonProps{
-					Label: "-5s", Variant: "secondary", Height: 28, PaddingX: 7, PaddingY: 3,
-					Tooltip: "Back 5 seconds (J)",
-				}),
-			},
-			{
-				ID:   "fs_play_pause",
-				Kind: pluginapi.UINodeButton,
-				Props: mustProps(pluginapi.UIButtonProps{
-					Label: playLabel, Icon: playIcon, Variant: "primary", Height: 30, PaddingX: 12, PaddingY: 4,
-					Tooltip: "Play / Pause / Resume (Space or K)",
-				}),
-			},
-			{
-				ID:   "fs_skip_fwd",
-				Kind: pluginapi.UINodeButton,
-				Props: mustProps(pluginapi.UIButtonProps{
-					Label: "+5s", Variant: "secondary", Height: 28, PaddingX: 7, PaddingY: 3,
-					Tooltip: "Forward 5 seconds (L)",
-				}),
-			},
-			{
-				ID:   "fs_jump_out",
-				Kind: pluginapi.UINodeButton,
-				Props: mustProps(pluginapi.UIButtonProps{
-					Icon: "skip-forward", IconOnly: true, Variant: "secondary", Width: 28, Height: 28,
-					Tooltip: "Jump to OUT / End (End)",
-				}),
-			},
-			{
-				ID:   "fs_timecode",
-				Kind: pluginapi.UINodeText,
-				Props: mustProps(pluginapi.UITextProps{
-					Text:          fmt.Sprintf("%s / %s", FormatTimecodePrecise(s.PlayheadSec), FormatTimecodePrecise(dur)),
-					Variant:       "body",
-					TabularNums:   true,
-					FontWeight:    600,
-					BindVideoTime: "video_player",
-					BindDuration:  dur,
-				}),
-			},
-			{
-				ID:    "fs_mark_in",
-				Kind:  pluginapi.UINodeButton,
-				Props: mustProps(pluginapi.UIButtonProps{Label: "[ IN", Variant: "secondary"}),
-			},
-			{
-				ID:    "fs_mark_out",
-				Kind:  pluginapi.UINodeButton,
-				Props: mustProps(pluginapi.UIButtonProps{Label: "OUT ]", Variant: "secondary"}),
-			},
-			{
-				ID:    "fs_loop_toggle",
-				Kind:  pluginapi.UINodeButton,
-				Props: mustProps(pluginapi.UIButtonProps{Label: "Loop", Icon: "repeat", Variant: "secondary", Selected: s.LoopSelection}),
-			},
-			{
-				ID:    "fs_snapshot_hd",
-				Kind:  pluginapi.UINodeButton,
-				Props: mustProps(pluginapi.UIButtonProps{Label: "HD", Icon: "camera", Variant: "secondary", Disabled: !s.HasFFmpeg}),
-			},
-		},
+		Children: kids,
 	}
 }
 
-func playButtonState(s State) (label, icon string) {
+func playButtonState(ms ModeSession) (label, icon string) {
 	switch {
-	case s.IsPlaying:
+	case ms.IsPlaying:
 		return "Pause", "pause"
-	case s.PlayEnded:
+	case ms.PlayEnded:
 		return "Replay", "play"
-	case s.PlayheadSec > 0.15:
+	case ms.PlayheadSec > 0.15:
 		return "Resume", "play"
 	default:
 		return "Play", "play"
 	}
 }
 
-func renderFullscreenDialog(s State) pluginapi.UINode {
+func renderFullscreenDialog(s State, ms ModeSession) pluginapi.UINode {
 	w := s.ViewportW - 80
 	if w < 480 {
 		w = 480
@@ -736,12 +1050,16 @@ func renderFullscreenDialog(s State) pluginapi.UINode {
 	if h < 260 {
 		h = 260
 	}
+	subtitle := "Press Space to Play/Pause · Esc to Exit Fullscreen"
+	if modeUsesTrimRange(s.Mode) {
+		subtitle = "Press Space to Play/Pause · I/O to Mark IN/OUT · Esc to Exit Fullscreen"
+	}
 	return pluginapi.UINode{
 		ID:   "fs_dialog",
 		Kind: pluginapi.UINodeDialog,
 		Props: mustProps(pluginapi.UIDialogProps{
-			Title:       filepath.Base(s.Probe.Path),
-			Subtitle:    "Press Space to Play/Pause · I/O to Mark IN/OUT · Esc to Exit Fullscreen",
+			Title:       filepath.Base(ms.Probe.Path),
+			Subtitle:    subtitle,
 			Open:        true,
 			Width:       4096,
 			MaxWidth:    4096,
@@ -760,15 +1078,15 @@ func renderFullscreenDialog(s State) pluginapi.UINode {
 					Justify: "center",
 				}),
 				Children: []pluginapi.UINode{
-					buildVideoPlayerNode(s, w, h, false),
-					renderFullscreenTransportRow(s),
+					buildVideoPlayerNode(s, ms, w, h, false),
+					renderFullscreenTransportRow(s, ms),
 				},
 			},
 		},
 	}
 }
 
-func renderInspectorSidebar(s State) pluginapi.UINode {
+func renderInspectorSidebar(s State, ms ModeSession) pluginapi.UINode {
 	if s.RailCollapsed {
 		return pluginapi.UINode{
 			ID:   "inspector_collapsed",
@@ -832,7 +1150,7 @@ func renderInspectorSidebar(s State) pluginapi.UINode {
 			Compact: true,
 			Tabs: []pluginapi.SurfaceOption{
 				{Label: "Inspector", Value: "inspector"},
-				{Label: fmt.Sprintf("Files (%d)", len(s.InputFiles)), Value: "files"},
+				{Label: fmt.Sprintf("Files (%d)", len(ms.InputFiles)), Value: "files"},
 				{Label: fmt.Sprintf("Queue (%d)", len(s.QueueItems)), Value: "queue"},
 			},
 		}),
@@ -843,9 +1161,9 @@ func renderInspectorSidebar(s State) pluginapi.UINode {
 	case "queue":
 		children = append(children, renderQueuePanel(s))
 	case "files":
-		children = append(children, renderFilesPanel(s))
+		children = append(children, renderFilesPanel(ms))
 	default:
-		children = append(children, renderInspectorPanel(s))
+		children = append(children, renderInspectorPanel(s, ms))
 	}
 
 	stacked := s.ViewportW > 0 && s.ViewportW < 680
@@ -871,7 +1189,7 @@ func renderInspectorSidebar(s State) pluginapi.UINode {
 	}
 }
 
-func renderFilesPanel(s State) pluginapi.UINode {
+func renderFilesPanel(ms ModeSession) pluginapi.UINode {
 	hdr := pluginapi.UINode{
 		ID:   "files_hdr_row",
 		Kind: pluginapi.UINodeRow,
@@ -901,13 +1219,13 @@ func renderFilesPanel(s State) pluginapi.UINode {
 				Props: mustProps(pluginapi.UIButtonProps{
 					Label:    "Clear",
 					Variant:  "ghost",
-					Disabled: len(s.InputFiles) == 0,
+					Disabled: len(ms.InputFiles) == 0,
 				}),
 			},
 		},
 	}
 
-	if len(s.InputFiles) == 0 {
+	if len(ms.InputFiles) == 0 {
 		return pluginapi.UINode{
 			ID:   "files_panel",
 			Kind: pluginapi.UINodeColumn,
@@ -919,7 +1237,7 @@ func renderFilesPanel(s State) pluginapi.UINode {
 					Kind: pluginapi.UINodeEmpty,
 					Props: mustProps(pluginapi.UIEmptyProps{
 						Title:    "No files loaded",
-						Subtitle: "Add one or more videos or audio files to inspect, trim, or batch-merge.",
+						Subtitle: "Add one or more media files for this mode.",
 					}),
 				},
 			},
@@ -927,8 +1245,8 @@ func renderFilesPanel(s State) pluginapi.UINode {
 	}
 
 	kids := []pluginapi.UINode{hdr}
-	for i, path := range s.InputFiles {
-		selected := i == s.ActiveFileIdx
+	for i, path := range ms.InputFiles {
+		selected := i == ms.ActiveFileIdx
 		surface := "ground"
 		borderTok := "ink"
 		if selected {
@@ -981,18 +1299,18 @@ func renderFilesPanel(s State) pluginapi.UINode {
 	}
 }
 
-func renderInspectorPanel(s State) pluginapi.UINode {
+func renderInspectorPanel(s State, ms ModeSession) pluginapi.UINode {
 	var children []pluginapi.UINode
 
 	switch s.Mode {
 	case engine.ModeTrim:
-		children = renderTrimInspector(s)
+		children = renderTrimInspector(s, ms)
 	case engine.ModeStreams:
-		children = renderStreamsInspector(s)
+		children = renderStreamsInspector(s, ms)
 	case engine.ModeFrames:
-		children = renderFramesInspector(s)
+		children = renderFramesInspector(s, ms)
 	default:
-		children = renderConvertInspector(s)
+		children = renderConvertInspector(s, ms)
 	}
 
 	return pluginapi.UINode{
@@ -1003,7 +1321,7 @@ func renderInspectorPanel(s State) pluginapi.UINode {
 	}
 }
 
-func renderConvertInspector(s State) []pluginapi.UINode {
+func renderConvertInspector(s State, ms ModeSession) []pluginapi.UINode {
 	subTab := s.ConvertSubTab
 	if subTab != "format" && subTab != "quality" && subTab != "output" {
 		subTab = "presets"
@@ -1160,6 +1478,17 @@ func renderConvertInspector(s State) []pluginapi.UINode {
 					Props: mustProps(pluginapi.UITextProps{
 						Text:    warn,
 						Variant: "danger",
+					}),
+				})
+			}
+			if s.HWPlan.SummaryLabel != "" {
+				nodes = append(nodes, pluginapi.UINode{
+					ID:   "conv_hw_status",
+					Kind: pluginapi.UINodeText,
+					Props: mustProps(pluginapi.UITextProps{
+						Text:     "Hardware: " + s.HWPlan.SummaryLabel,
+						Variant:  "muted",
+						FontSize: 12,
 					}),
 				})
 			}
@@ -1329,13 +1658,13 @@ func renderConvertInspector(s State) []pluginapi.UINode {
 		}
 
 	case "output":
-		nodes = append(nodes, renderOutputSection(s)...)
+		nodes = append(nodes, renderOutputSection(s, ms)...)
 	}
 
 	return nodes
 }
 
-func renderOutputSection(s State) []pluginapi.UINode {
+func renderOutputSection(s State, ms ModeSession) []pluginapi.UINode {
 	nodes := []pluginapi.UINode{
 		{
 			ID:   "output_dir_picker",
@@ -1347,12 +1676,12 @@ func renderOutputSection(s State) []pluginapi.UINode {
 		},
 	}
 
-	if s.Probe != nil {
-		clipDur := maxFloat(0, s.EndSec-s.StartSec)
-		if clipDur <= 0 {
-			clipDur = s.Probe.DurationSec
+	if ms.Probe != nil {
+		clipDur := ms.Probe.DurationSec
+		if modeUsesTrimRange(s.Mode) && ms.EndSec > ms.StartSec {
+			clipDur = ms.EndSec - ms.StartSec
 		}
-		estBytes, compatLabel, compatOK := engine.EstimateOutputBytes(s.Probe, s.Mode, s.Opts, clipDur)
+		estBytes, compatLabel, compatOK := engine.EstimateOutputBytes(ms.Probe, s.Mode, s.Opts, clipDur)
 		estLine := compatLabel
 		if estBytes > 0 {
 			estLine = fmt.Sprintf("Est. %s · %s", formatBytesHuman(estBytes), compatLabel)
@@ -1406,9 +1735,9 @@ func renderOutputSection(s State) []pluginapi.UINode {
 			FillWidth: true,
 		}),
 	})
-	if s.ShowCmdPreview && s.Probe != nil {
+	if s.ShowCmdPreview && ms.Probe != nil {
 		if spec, err := s.buildCurrentJobSpec(); err == nil {
-			if plan, perr := engine.BuildCommandPlan(spec, s.Probe); perr == nil {
+			if plan, perr := engine.BuildCommandPlan(spec, ms.Probe); perr == nil {
 				nodes = append(nodes, pluginapi.UINode{
 					ID:   "cmd_preview_box",
 					Kind: pluginapi.UINodeColumn,
@@ -1434,13 +1763,13 @@ func renderOutputSection(s State) []pluginapi.UINode {
 	return nodes
 }
 
-func renderTrimInspector(s State) []pluginapi.UINode {
+func renderTrimInspector(s State, ms ModeSession) []pluginapi.UINode {
 	concatOpts := []pluginapi.SurfaceOption{
 		{Label: "Single Clip / Cut List", Value: "single"},
 	}
-	if len(s.InputFiles) >= 2 {
+	if len(ms.InputFiles) >= 2 {
 		concatOpts = append(concatOpts, pluginapi.SurfaceOption{
-			Label: fmt.Sprintf("Merge %d Queued Files", len(s.InputFiles)),
+			Label: fmt.Sprintf("Merge %d Queued Files", len(ms.InputFiles)),
 			Value: "concat_files",
 		})
 	}
@@ -1479,10 +1808,10 @@ func renderTrimInspector(s State) []pluginapi.UINode {
 			}),
 		},
 	}
-	return append(nodes, renderOutputSection(s)...)
+	return append(nodes, renderOutputSection(s, ms)...)
 }
 
-func renderStreamsInspector(s State) []pluginapi.UINode {
+func renderStreamsInspector(s State, ms ModeSession) []pluginapi.UINode {
 	subTab := s.StreamsSubTab
 	if subTab != "subtitles" && subTab != "metadata" {
 		subTab = "audio"
@@ -1509,8 +1838,8 @@ func renderStreamsInspector(s State) []pluginapi.UINode {
 		audioTrackOpts := []pluginapi.SurfaceOption{
 			{Label: "Keep All Audio Tracks", Value: "-1"},
 		}
-		if s.Probe != nil {
-			for i, a := range s.Probe.AudioStreams {
+		if ms.Probe != nil {
+			for i, a := range ms.Probe.AudioStreams {
 				lbl := fmt.Sprintf("Track %d (%s", i+1, strings.ToUpper(a.Codec))
 				if a.Language != "" {
 					lbl += " · " + a.Language
@@ -1621,10 +1950,10 @@ func renderStreamsInspector(s State) []pluginapi.UINode {
 		)
 	}
 
-	return append(nodes, renderOutputSection(s)...)
+	return append(nodes, renderOutputSection(s, ms)...)
 }
 
-func renderFramesInspector(s State) []pluginapi.UINode {
+func renderFramesInspector(s State, ms ModeSession) []pluginapi.UINode {
 	op := nonEmptyStr(s.Opts.FramesOp, "gif")
 	nodes := []pluginapi.UINode{
 		{
@@ -1730,7 +2059,7 @@ func renderFramesInspector(s State) []pluginapi.UINode {
 			},
 		)
 	}
-	return append(nodes, renderOutputSection(s)...)
+	return append(nodes, renderOutputSection(s, ms)...)
 }
 
 func renderQueuePanel(s State) pluginapi.UINode {
@@ -1923,37 +2252,97 @@ func renderQueueItem(it queue.Item) pluginapi.UINode {
 	}
 }
 
-func renderTimelineDeck(s State) pluginapi.UINode {
+func renderTimelineDeck(s State, ms ModeSession) pluginapi.UINode {
+	if s.DeckCollapsed {
+		return renderCollapsedTimelineDeck(s, ms)
+	}
+	if modeUsesTrimRange(s.Mode) {
+		return renderTrimDeck(s, ms)
+	}
+	return renderPlaybackDeck(s, ms)
+}
+
+func renderDeckTimeGroup(s State, ms ModeSession, includeClipBadge bool) pluginapi.UINode {
+	dur := 0.0
+	if ms.Probe != nil {
+		dur = ms.Probe.DurationSec
+	}
+	kids := []pluginapi.UINode{
+		{
+			ID:   "mon_timecode",
+			Kind: pluginapi.UINodeText,
+			Props: mustProps(pluginapi.UITextProps{
+				Text:          fmt.Sprintf("%s / %s", FormatTimecodePrecise(ms.PlayheadSec), FormatTimecodePrecise(dur)),
+				FontSize:      13,
+				FontWeight:    700,
+				TabularNums:   true,
+				SingleLine:    true,
+				BindVideoTime: "video_player",
+				BindDuration:  dur,
+			}),
+		},
+	}
+	if includeClipBadge {
+		clipDur := maxFloat(0, ms.EndSec-ms.StartSec)
+		clipBadgeText := "CLIP " + FormatTimestamp(clipDur)
+		if ms.Probe != nil {
+			estBytes, _, ok := engine.EstimateOutputBytes(ms.Probe, s.Mode, s.Opts, clipDur)
+			if ok && estBytes > 0 {
+				clipBadgeText = fmt.Sprintf("CLIP %s · Est. %s", FormatTimestamp(clipDur), formatBytesHuman(estBytes))
+			}
+		}
+		kids = append(kids, pluginapi.UINode{
+			ID:   "tl_clip_badge",
+			Kind: pluginapi.UINodeText,
+			Props: mustProps(pluginapi.UITextProps{
+				Text:        clipBadgeText,
+				Variant:     "muted",
+				FontSize:    12,
+				TabularNums: true,
+				SingleLine:  true,
+			}),
+		})
+	}
+	if ms.FilmstripLoading && ms.StripAsset == "" {
+		kids = append(kids, pluginapi.UINode{
+			ID:   "tl_strip_loading",
+			Kind: pluginapi.UINodeText,
+			Props: mustProps(pluginapi.UITextProps{
+				Text:       "Thumbnails…",
+				Variant:    "muted",
+				FontSize:   11,
+				SingleLine: true,
+			}),
+		})
+	}
+	return pluginapi.UINode{
+		ID:   "tl_time_grp",
+		Kind: pluginapi.UINodeRow,
+		Props: mustProps(pluginapi.UIContainerProps{
+			Gap:         8,
+			Align:       "center",
+			NoFillWidth: true,
+		}),
+		Children: kids,
+	}
+}
+
+func renderDeckToolsGroup(s State, ms ModeSession, includeLoop, includeHideBtn bool) pluginapi.UINode {
 	dur := 0.0
 	hasVideo := false
-	var chapters []engine.ChapterInfo
-	if s.Probe != nil {
-		dur = s.Probe.DurationSec
-		hasVideo = s.Probe.HasVideo()
-		chapters = s.Probe.Chapters
+	if ms.Probe != nil {
+		dur = ms.Probe.DurationSec
+		hasVideo = ms.Probe.HasVideo()
 	}
-	disabled := s.Probe == nil || dur <= 0
-	trackW := ComputeTrackWidth(s.ViewportW)
-
-	clipDur := maxFloat(0, s.EndSec-s.StartSec)
-	clipBadgeText := "CLIP " + FormatTimestamp(clipDur)
-	if s.Probe != nil {
-		estBytes, _, ok := engine.EstimateOutputBytes(s.Probe, s.Mode, s.Opts, clipDur)
-		if ok && estBytes > 0 {
-			clipBadgeText = fmt.Sprintf("CLIP %s · Est. %s", FormatTimestamp(clipDur), formatBytesHuman(estBytes))
-		}
-	}
-
-	playLabel, playIcon := playButtonState(s)
+	disabled := ms.Probe == nil || dur <= 0 || s.VideoPreviewMode == VideoPreviewOff
 	volIcon := "volume"
-	if s.Muted || s.Volume <= 0.01 {
+	if ms.Muted || ms.Volume <= 0.01 {
 		volIcon = "volume-mute"
 	}
-	rate := s.PlaybackRate
+	rate := ms.PlaybackRate
 	if rate <= 0 {
 		rate = 1.0
 	}
-
 	toolsKids := []pluginapi.UINode{
 		{
 			ID:   "btn_speed_cycle",
@@ -1988,30 +2377,32 @@ func renderTimelineDeck(s State) pluginapi.UINode {
 				Min:      0,
 				Max:      1,
 				Step:     0.05,
-				Value:    s.Volume,
+				Value:    ms.Volume,
 				Width:    84,
 				Disabled: disabled,
 			}),
 		},
-		{
+	}
+	if includeLoop {
+		toolsKids = append(toolsKids, pluginapi.UINode{
 			ID:   "btn_loop_toggle",
 			Kind: pluginapi.UINodeButton,
 			Props: mustProps(pluginapi.UIButtonProps{
 				Label:    "Loop",
 				Icon:     "repeat",
 				Variant:  "secondary",
-				Selected: s.LoopSelection,
+				Selected: ms.LoopSelection,
 				Height:   28,
 				PaddingX: 8,
 				PaddingY: 3,
 				Disabled: disabled,
 				Tooltip:  "Loop between IN and OUT (Shift+L)",
 			}),
-		},
+		})
 	}
 	if hasVideo {
 		fitLabel := "Fill"
-		if s.EffectiveVideoFit() == "cover" {
+		if ms.EffectiveVideoFit() == "cover" {
 			fitLabel = "Fit"
 		}
 		toolsKids = append(toolsKids,
@@ -2021,7 +2412,7 @@ func renderTimelineDeck(s State) pluginapi.UINode {
 				Props: mustProps(pluginapi.UIButtonProps{
 					Label:    fitLabel,
 					Variant:  "secondary",
-					Selected: s.EffectiveVideoFit() == "cover",
+					Selected: ms.EffectiveVideoFit() == "cover",
 					Height:   28,
 					PaddingX: 8,
 					PaddingY: 3,
@@ -2056,6 +2447,103 @@ func renderTimelineDeck(s State) pluginapi.UINode {
 			},
 		)
 	}
+	if includeHideBtn {
+		tip := "Hide Player Deck"
+		if modeUsesTrimRange(s.Mode) {
+			tip = "Hide Timeline Deck"
+		}
+		toolsKids = append(toolsKids, pluginapi.UINode{
+			ID:   "btn_deck_toggle",
+			Kind: pluginapi.UINodeButton,
+			Props: mustProps(pluginapi.UIButtonProps{
+				Icon:     "chevron-down",
+				IconOnly: true,
+				Variant:  "secondary",
+				Width:    28,
+				Height:   28,
+				Tooltip:  tip,
+			}),
+		})
+	}
+	return pluginapi.UINode{
+		ID:   "tl_tools_grp",
+		Kind: pluginapi.UINodeRow,
+		Props: mustProps(pluginapi.UIContainerProps{
+			Gap:         6,
+			Align:       "center",
+			NoFillWidth: true,
+			Wrap:        true,
+		}),
+		Children: toolsKids,
+	}
+}
+
+func renderCollapsedTimelineDeck(s State, ms ModeSession) pluginapi.UINode {
+	playLabel, playIcon := playButtonState(ms)
+	showLabel := "Show Player"
+	if modeUsesTrimRange(s.Mode) {
+		showLabel = "Show Timeline"
+	}
+	return pluginapi.UINode{
+		ID:   "timeline_deck",
+		Kind: pluginapi.UINodeRow,
+		Props: mustProps(pluginapi.UIContainerProps{
+			Surface:     "paper",
+			BorderSides: [4]int{2, 0, 0, 0},
+			BorderToken: "ink",
+			PaddingH:    16,
+			PaddingV:    6,
+			Gap:         10,
+			Align:       "center",
+			Justify:     "between",
+			Wrap:        true,
+		}),
+		Children: []pluginapi.UINode{
+			{
+				ID:   "tl_collapsed_left",
+				Kind: pluginapi.UINodeRow,
+				Props: mustProps(pluginapi.UIContainerProps{
+					Gap:         10,
+					Align:       "center",
+					NoFillWidth: true,
+				}),
+				Children: []pluginapi.UINode{
+					{
+						ID:   "btn_play_pause",
+						Kind: pluginapi.UINodeButton,
+						Props: mustProps(pluginapi.UIButtonProps{
+							Label: playLabel, Icon: playIcon, Variant: "primary", Height: 28, PaddingX: 10, PaddingY: 3,
+							Tooltip: "Play / Pause / Resume (Space or K)",
+						}),
+					},
+					renderDeckTimeGroup(s, ms, modeUsesTrimRange(s.Mode)),
+				},
+			},
+			{
+				ID:   "btn_deck_toggle",
+				Kind: pluginapi.UINodeButton,
+				Props: mustProps(pluginapi.UIButtonProps{
+					Label:    showLabel,
+					Icon:     "chevron-up",
+					Variant:  "secondary",
+					Height:   28,
+					PaddingX: 10,
+					PaddingY: 3,
+					Tooltip:  showLabel,
+				}),
+			},
+		},
+	}
+}
+
+func renderPlaybackDeck(s State, ms ModeSession) pluginapi.UINode {
+	dur := 0.0
+	if ms.Probe != nil {
+		dur = ms.Probe.DurationSec
+	}
+	disabled := ms.Probe == nil || dur <= 0 || s.VideoPreviewMode == VideoPreviewOff
+	trackW := ComputeTrackWidth(s.ViewportW)
+	playLabel, playIcon := playButtonState(ms)
 
 	transportRow := pluginapi.UINode{
 		ID:   "tl_transport_row",
@@ -2067,41 +2555,88 @@ func renderTimelineDeck(s State) pluginapi.UINode {
 			Justify: "between",
 		}),
 		Children: []pluginapi.UINode{
+			renderDeckTimeGroup(s, ms, false),
 			{
-				ID:   "tl_time_grp",
+				ID:   "btn_transport_row",
 				Kind: pluginapi.UINodeRow,
 				Props: mustProps(pluginapi.UIContainerProps{
-					Gap:         8,
+					Gap:         4,
 					Align:       "center",
 					NoFillWidth: true,
 				}),
 				Children: []pluginapi.UINode{
 					{
-						ID:   "mon_timecode",
-						Kind: pluginapi.UINodeText,
-						Props: mustProps(pluginapi.UITextProps{
-							Text:          fmt.Sprintf("%s / %s", FormatTimecodePrecise(s.PlayheadSec), FormatTimecodePrecise(dur)),
-							FontSize:      13,
-							FontWeight:    700,
-							TabularNums:   true,
-							SingleLine:    true,
-							BindVideoTime: "video_player",
-							BindDuration:  dur,
+						ID:   "btn_skip_back",
+						Kind: pluginapi.UINodeButton,
+						Props: mustProps(pluginapi.UIButtonProps{
+							Label: "-5s", Variant: "secondary", Height: 28, PaddingX: 7, PaddingY: 3, Disabled: disabled,
+							Tooltip: "Back 5 seconds (J)",
 						}),
 					},
 					{
-						ID:   "tl_clip_badge",
-						Kind: pluginapi.UINodeText,
-						Props: mustProps(pluginapi.UITextProps{
-							Text:        clipBadgeText,
-							Variant:     "muted",
-							FontSize:    12,
-							TabularNums: true,
-							SingleLine:  true,
+						ID:   "btn_play_pause",
+						Kind: pluginapi.UINodeButton,
+						Props: mustProps(pluginapi.UIButtonProps{
+							Label: playLabel, Icon: playIcon, Variant: "primary", Height: 30, PaddingX: 12, PaddingY: 4, Disabled: disabled,
+							Tooltip: "Play / Pause / Resume (Space or K)",
+						}),
+					},
+					{
+						ID:   "btn_skip_fwd",
+						Kind: pluginapi.UINodeButton,
+						Props: mustProps(pluginapi.UIButtonProps{
+							Label: "+5s", Variant: "secondary", Height: 28, PaddingX: 7, PaddingY: 3, Disabled: disabled,
+							Tooltip: "Forward 5 seconds (L)",
 						}),
 					},
 				},
 			},
+			renderDeckToolsGroup(s, ms, false, true),
+		},
+	}
+
+	scrubBar := BuildPlaybackBarNode(trackW, dur, ms.PlayheadSec, disabled)
+
+	return pluginapi.UINode{
+		ID:   "timeline_deck",
+		Kind: pluginapi.UINodeColumn,
+		Props: mustProps(pluginapi.UIContainerProps{
+			Surface:     "paper",
+			BorderSides: [4]int{2, 0, 0, 0},
+			BorderToken: "ink",
+			PaddingH:    20,
+			PaddingV:    12,
+			Gap:         8,
+			Align:       "center",
+		}),
+		Children: []pluginapi.UINode{transportRow, scrubBar},
+	}
+}
+
+func renderTrimDeck(s State, ms ModeSession) pluginapi.UINode {
+	dur := 0.0
+	var chapters []engine.ChapterInfo
+	if ms.Probe != nil {
+		dur = ms.Probe.DurationSec
+		chapters = ms.Probe.Chapters
+	}
+	disabled := ms.Probe == nil || dur <= 0
+	transportDisabled := disabled || s.VideoPreviewMode == VideoPreviewOff
+	trackW := ComputeTrackWidth(s.ViewportW)
+	includeClips := modeUsesClips(s.Mode)
+	playLabel, playIcon := playButtonState(ms)
+
+	transportRow := pluginapi.UINode{
+		ID:   "tl_transport_row",
+		Kind: pluginapi.UINodeRow,
+		Props: mustProps(pluginapi.UIContainerProps{
+			Wrap:    true,
+			Gap:     8,
+			Align:   "center",
+			Justify: "between",
+		}),
+		Children: []pluginapi.UINode{
+			renderDeckTimeGroup(s, ms, true),
 			{
 				ID:   "btn_transport_row",
 				Kind: pluginapi.UINodeRow,
@@ -2115,15 +2650,15 @@ func renderTimelineDeck(s State) pluginapi.UINode {
 						ID:   "btn_jump_in",
 						Kind: pluginapi.UINodeButton,
 						Props: mustProps(pluginapi.UIButtonProps{
-							Icon: "skip-back", IconOnly: true, Variant: "secondary", Width: 28, Height: 28, Disabled: disabled,
-							Tooltip: "Jump to IN / Start (Home)",
+							Icon: "skip-back", IconOnly: true, Variant: "secondary", Width: 28, Height: 28, Disabled: transportDisabled,
+							Tooltip: "Jump to IN (Home)",
 						}),
 					},
 					{
 						ID:   "btn_skip_back",
 						Kind: pluginapi.UINodeButton,
 						Props: mustProps(pluginapi.UIButtonProps{
-							Label: "-5s", Variant: "secondary", Height: 28, PaddingX: 7, PaddingY: 3, Disabled: disabled,
+							Label: "-5s", Variant: "secondary", Height: 28, PaddingX: 7, PaddingY: 3, Disabled: transportDisabled,
 							Tooltip: "Back 5 seconds (J)",
 						}),
 					},
@@ -2131,7 +2666,7 @@ func renderTimelineDeck(s State) pluginapi.UINode {
 						ID:   "btn_step_back",
 						Kind: pluginapi.UINodeButton,
 						Props: mustProps(pluginapi.UIButtonProps{
-							Icon: "step-back", IconOnly: true, Variant: "secondary", Width: 28, Height: 28, Disabled: disabled,
+							Icon: "step-back", IconOnly: true, Variant: "secondary", Width: 28, Height: 28, Disabled: transportDisabled,
 							Tooltip: "Previous Frame (,)",
 						}),
 					},
@@ -2139,7 +2674,7 @@ func renderTimelineDeck(s State) pluginapi.UINode {
 						ID:   "btn_play_pause",
 						Kind: pluginapi.UINodeButton,
 						Props: mustProps(pluginapi.UIButtonProps{
-							Label: playLabel, Icon: playIcon, Variant: "primary", Height: 30, PaddingX: 12, PaddingY: 4, Disabled: disabled,
+							Label: playLabel, Icon: playIcon, Variant: "primary", Height: 30, PaddingX: 12, PaddingY: 4, Disabled: transportDisabled,
 							Tooltip: "Play / Pause / Resume (Space or K)",
 						}),
 					},
@@ -2147,7 +2682,7 @@ func renderTimelineDeck(s State) pluginapi.UINode {
 						ID:   "btn_step_fwd",
 						Kind: pluginapi.UINodeButton,
 						Props: mustProps(pluginapi.UIButtonProps{
-							Icon: "step-forward", IconOnly: true, Variant: "secondary", Width: 28, Height: 28, Disabled: disabled,
+							Icon: "step-forward", IconOnly: true, Variant: "secondary", Width: 28, Height: 28, Disabled: transportDisabled,
 							Tooltip: "Next Frame (.)",
 						}),
 					},
@@ -2155,7 +2690,7 @@ func renderTimelineDeck(s State) pluginapi.UINode {
 						ID:   "btn_skip_fwd",
 						Kind: pluginapi.UINodeButton,
 						Props: mustProps(pluginapi.UIButtonProps{
-							Label: "+5s", Variant: "secondary", Height: 28, PaddingX: 7, PaddingY: 3, Disabled: disabled,
+							Label: "+5s", Variant: "secondary", Height: 28, PaddingX: 7, PaddingY: 3, Disabled: transportDisabled,
 							Tooltip: "Forward 5 seconds (L)",
 						}),
 					},
@@ -2163,28 +2698,19 @@ func renderTimelineDeck(s State) pluginapi.UINode {
 						ID:   "btn_jump_out",
 						Kind: pluginapi.UINodeButton,
 						Props: mustProps(pluginapi.UIButtonProps{
-							Icon: "skip-forward", IconOnly: true, Variant: "secondary", Width: 28, Height: 28, Disabled: disabled,
-							Tooltip: "Jump to OUT / End (End)",
+							Icon: "skip-forward", IconOnly: true, Variant: "secondary", Width: 28, Height: 28, Disabled: transportDisabled,
+							Tooltip: "Jump to OUT (End)",
 						}),
 					},
 				},
 			},
-			{
-				ID:   "tl_tools_grp",
-				Kind: pluginapi.UINodeRow,
-				Props: mustProps(pluginapi.UIContainerProps{
-					Gap:         6,
-					Align:       "center",
-					NoFillWidth: true,
-					Wrap:        true,
-				}),
-				Children: toolsKids,
-			},
+			renderDeckToolsGroup(s, ms, true, true),
 		},
 	}
 
-	midKids := []pluginapi.UINode{
-		{
+	var midKids []pluginapi.UINode
+	if includeClips {
+		midKids = append(midKids, pluginapi.UINode{
 			ID:   "btn_add_clip",
 			Kind: pluginapi.UINodeButton,
 			Props: mustProps(pluginapi.UIButtonProps{
@@ -2195,21 +2721,21 @@ func renderTimelineDeck(s State) pluginapi.UINode {
 				PaddingY: 3,
 				Disabled: disabled,
 			}),
-		},
-	}
-	if len(chapters) > 0 {
-		midKids = append(midKids, pluginapi.UINode{
-			ID:   "btn_split_chapters",
-			Kind: pluginapi.UINodeButton,
-			Props: mustProps(pluginapi.UIButtonProps{
-				Label:    fmt.Sprintf("Split %d Chapters", len(chapters)),
-				Variant:  "secondary",
-				Height:   26,
-				PaddingX: 8,
-				PaddingY: 3,
-				Disabled: disabled,
-			}),
 		})
+		if len(chapters) > 0 {
+			midKids = append(midKids, pluginapi.UINode{
+				ID:   "btn_split_chapters",
+				Kind: pluginapi.UINodeButton,
+				Props: mustProps(pluginapi.UIButtonProps{
+					Label:    fmt.Sprintf("Split %d Chapters", len(chapters)),
+					Variant:  "secondary",
+					Height:   26,
+					PaddingX: 8,
+					PaddingY: 3,
+					Disabled: disabled,
+				}),
+			})
+		}
 	}
 	midKids = append(midKids, pluginapi.UINode{
 		ID:   "btn_trim_reset",
@@ -2260,7 +2786,7 @@ func renderTimelineDeck(s State) pluginapi.UINode {
 						ID:   "time_start_input",
 						Kind: pluginapi.UINodeTextInput,
 						Props: mustProps(pluginapi.UITextInputProps{
-							Value:       s.StartText,
+							Value:       ms.StartText,
 							Placeholder: "00:00",
 							Width:       68,
 							Disabled:    disabled,
@@ -2320,7 +2846,7 @@ func renderTimelineDeck(s State) pluginapi.UINode {
 						ID:   "time_end_input",
 						Kind: pluginapi.UINodeTextInput,
 						Props: mustProps(pluginapi.UITextInputProps{
-							Value:       s.EndText,
+							Value:       ms.EndText,
 							Placeholder: "00:00",
 							Width:       68,
 							Disabled:    disabled,
@@ -2344,12 +2870,12 @@ func renderTimelineDeck(s State) pluginapi.UINode {
 		},
 	}
 
-	stripFrame := BuildTimelineNode(trackW, dur, s.StartSec, s.EndSec, s.PlayheadSec, s.StripAsset, chapters, s.Clips, disabled)
+	stripFrame := BuildTimelineNode(trackW, dur, ms.StartSec, ms.EndSec, ms.PlayheadSec, ms.StripAsset, chapters, ms.Clips, includeClips, disabled)
 	deckKids := []pluginapi.UINode{transportRow, stripFrame, controlsRow}
 
-	if len(s.Clips) > 0 {
-		clipChips := make([]pluginapi.UINode, 0, len(s.Clips)*2)
-		for _, cl := range s.Clips {
+	if includeClips && len(ms.Clips) > 0 {
+		clipChips := make([]pluginapi.UINode, 0, len(ms.Clips)*2)
+		for _, cl := range ms.Clips {
 			clipChips = append(clipChips,
 				pluginapi.UINode{
 					ID:   "clip_select_" + cl.ID,

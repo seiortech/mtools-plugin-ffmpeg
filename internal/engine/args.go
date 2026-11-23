@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -83,15 +84,17 @@ type JobSpec struct {
 	Clips      []ClipSegment
 	Opts       TranscodeOptions
 	OutputDir  string
+	HW         HWPlan
 }
 
 type CommandStep struct {
-	Args              []string
-	TempOutput        string
-	FinalOutput       string
-	MultiOutputDir    string
-	DurationSec       float64
-	ConcatListContent string
+	Args                   []string
+	FallbackArgs           []string
+	TempOutput             string
+	FinalOutput            string
+	MultiOutputDir         string
+	DurationSec            float64
+	ConcatListContent      string
 	ConcatInputPlaceholder string
 }
 
@@ -154,18 +157,35 @@ func BuildCommandPlan(spec JobSpec, probe *MediaProbe) (CommandPlan, error) {
 		mode = ModeConvert
 	}
 
+	var plan CommandPlan
+	var err error
 	switch mode {
 	case ModeConvert:
-		return buildConvertPlan(spec, probe, outDir)
+		plan, err = buildConvertPlan(spec, probe, outDir)
 	case ModeTrim:
-		return buildTrimPlan(spec, probe, outDir)
+		plan, err = buildTrimPlan(spec, probe, outDir)
 	case ModeStreams:
-		return buildStreamsPlan(spec, probe, outDir)
+		plan, err = buildStreamsPlan(spec, probe, outDir)
 	case ModeFrames:
-		return buildFramesPlan(spec, probe, outDir)
+		plan, err = buildFramesPlan(spec, probe, outDir)
 	default:
-		return buildConvertPlan(spec, probe, outDir)
+		plan, err = buildConvertPlan(spec, probe, outDir)
 	}
+	if err != nil {
+		return CommandPlan{}, err
+	}
+	if spec.HW.Active() {
+		cpuSpec := spec
+		cpuSpec.HW = HWPlan{Mode: HWAccelOff}
+		if cpuPlan, cerr := BuildCommandPlan(cpuSpec, probe); cerr == nil && len(cpuPlan.Steps) == len(plan.Steps) {
+			for i := range plan.Steps {
+				if !slices.Equal(plan.Steps[i].Args, cpuPlan.Steps[i].Args) {
+					plan.Steps[i].FallbackArgs = cpuPlan.Steps[i].Args
+				}
+			}
+		}
+	}
+	return plan, nil
 }
 
 func buildConvertPlan(spec JobSpec, probe *MediaProbe, outDir string) (CommandPlan, error) {
@@ -182,7 +202,8 @@ func buildConvertPlan(spec JobSpec, probe *MediaProbe, outDir string) (CommandPl
 	finalOut := filepath.Join(outDir, base+"_converted."+container)
 	tempOut := tempPathFor(finalOut)
 
-	args := baseInputArgs(inPath, spec.StartSec, spec.EndSec, probe)
+	willDecode := !IsAudioOnlyContainer(container) && vcodec != "copy"
+	args := baseInputArgsWithHW(inPath, spec.StartSec, spec.EndSec, probe, spec.HW, willDecode)
 
 	if IsAudioOnlyContainer(container) {
 		args = append(args, "-vn")
@@ -190,51 +211,34 @@ func buildConvertPlan(spec JobSpec, probe *MediaProbe, outDir string) (CommandPl
 	} else if vcodec == "copy" {
 		args = append(args, "-c", "copy")
 	} else {
-		args = append(args, "-c:v", vcodec)
-		if vcodec == "libx264" || vcodec == "libx265" {
-			args = append(args, "-pix_fmt", "yuv420p")
-			if opts.EncoderPreset != "" {
-				args = append(args, "-preset", opts.EncoderPreset)
-			}
-		}
-		if vcodec == "libx265" && container == "mp4" {
-			args = append(args, "-tag:v", "hvc1")
-		}
-		if opts.ScaleHeight > 0 {
-			args = append(args, "-vf", fmt.Sprintf("scale=-2:min(ih\\,%d)", opts.ScaleHeight))
-		}
-
+		effCodec, _ := MapVideoEncoder(vcodec, spec.HW)
 		abr := opts.AudioBitrateK
 		if abr <= 0 {
 			abr = 192
 		}
+		var vKbps, maxRateKbps, bufSizeKbps int
 		switch opts.QualityMode {
 		case "target_mb":
 			if opts.TargetSizeMB <= 0 || dur <= 0 {
 				return CommandPlan{}, ErrInvalidTargetSize
 			}
 			totalKbps := int((opts.TargetSizeMB * 8192) / dur)
-			vKbps := totalKbps - abr
+			vKbps = totalKbps - abr
 			if opts.MuteAudio {
 				vKbps = totalKbps
 			}
 			if vKbps < 80 {
 				return CommandPlan{}, ErrInvalidTargetSize
 			}
-			args = append(args, "-b:v", fmt.Sprintf("%dk", vKbps), "-maxrate", fmt.Sprintf("%dk", int(float64(vKbps)*1.25)), "-bufsize", fmt.Sprintf("%dk", vKbps*2))
+			maxRateKbps = int(float64(vKbps) * 1.25)
+			bufSizeKbps = vKbps * 2
 		case "bitrate":
-			vKbps := opts.VideoBitrateK
+			vKbps = opts.VideoBitrateK
 			if vKbps <= 0 {
 				vKbps = 2500
 			}
-			args = append(args, "-b:v", fmt.Sprintf("%dk", vKbps))
-		default:
-			crf := opts.CRF
-			if crf <= 0 {
-				crf = 23
-			}
-			args = append(args, "-crf", strconv.Itoa(crf))
 		}
+		args = AppendVideoEncoderArgs(args, effCodec, container, opts.CRF, opts.EncoderPreset, opts.ScaleHeight, vKbps, maxRateKbps, bufSizeKbps, spec.HW)
 
 		if opts.MuteAudio {
 			args = append(args, "-an")
@@ -308,17 +312,21 @@ func buildTrimPlan(spec JobSpec, probe *MediaProbe, outDir string) (CommandPlan,
 		}
 		finalOut := filepath.Join(outDir, baseNameNoExt(inPath)+suffix+"."+container)
 		tempOut := tempPathFor(finalOut)
-		args := []string{
-			"-nostdin", "-y", "-hide_banner", "-progress", "pipe:1",
+		args := []string{"-nostdin", "-y", "-hide_banner", "-progress", "pipe:1"}
+		if !opts.LosslessCut {
+			args = append(args, DecodeInputPrefix(spec.HW)...)
+		}
+		args = append(args,
 			"-ss", fmt.Sprintf("%.3f", seg.StartSec),
 			"-to", fmt.Sprintf("%.3f", seg.EndSec),
 			"-i", inPath,
-		}
+		)
 		if opts.LosslessCut {
 			args = append(args, "-c", "copy")
 		} else {
 			vcodec := nonEmpty(opts.VideoCodec, "libx264")
-			args = append(args, "-c:v", vcodec, "-crf", strconv.Itoa(maxInt(opts.CRF, 20)), "-pix_fmt", "yuv420p")
+			effCodec, _ := MapVideoEncoder(vcodec, spec.HW)
+			args = AppendVideoEncoderArgs(args, effCodec, container, maxInt(opts.CRF, 20), opts.EncoderPreset, 0, 0, 0, 0, spec.HW)
 			args = appendAudioArgs(args, container, opts)
 		}
 		if container == "mp4" || container == "mov" {
@@ -350,9 +358,10 @@ func buildStreamsPlan(spec JobSpec, probe *MediaProbe, outDir string) (CommandPl
 	finalOut := filepath.Join(outDir, baseNameNoExt(inPath)+"_remuxed."+container)
 	tempOut := tempPathFor(finalOut)
 
-	args := baseInputArgs(inPath, spec.StartSec, spec.EndSec, probe)
 	hasExtAudio := strings.TrimSpace(opts.ExternalAudioPath) != ""
 	hasExtSub := strings.TrimSpace(opts.ExternalSubPath) != ""
+	willDecode := hasExtSub && opts.SubMode == "burn"
+	args := baseInputArgsWithHW(inPath, spec.StartSec, spec.EndSec, probe, spec.HW, willDecode)
 
 	if hasExtAudio {
 		args = append(args, "-i", strings.TrimSpace(opts.ExternalAudioPath))
@@ -451,7 +460,7 @@ func buildFramesPlan(spec JobSpec, probe *MediaProbe, outDir string) (CommandPla
 	inPath := spec.InputPaths[0]
 	base := baseNameNoExt(inPath)
 	dur := effectiveDuration(spec.StartSec, spec.EndSec, probe)
-	args := baseInputArgs(inPath, spec.StartSec, spec.EndSec, probe)
+	args := baseInputArgsWithHW(inPath, spec.StartSec, spec.EndSec, probe, spec.HW, true)
 
 	switch opts.FramesOp {
 	case "webp":
@@ -513,8 +522,11 @@ func buildFramesPlan(spec JobSpec, probe *MediaProbe, outDir string) (CommandPla
 	}
 }
 
-func baseInputArgs(inPath string, startSec, endSec float64, probe *MediaProbe) []string {
+func baseInputArgsWithHW(inPath string, startSec, endSec float64, probe *MediaProbe, hw HWPlan, willDecode bool) []string {
 	args := []string{"-nostdin", "-y", "-hide_banner", "-progress", "pipe:1"}
+	if willDecode {
+		args = append(args, DecodeInputPrefix(hw)...)
+	}
 	totalDur := 0.0
 	if probe != nil {
 		totalDur = probe.DurationSec

@@ -118,6 +118,67 @@
             { "label": "Auto-rename (file_1.mp4)", "value": "rename" },
             { "label": "Overwrite existing", "value": "overwrite" }
           ]
+        },
+        {
+          "id": "video_preview",
+          "kind": "select",
+          "label": "Video preview loading",
+          "description": "Control when the native video player opens after selecting a file. Switch to Trim & GIF Only or Manual for even faster Convert loading.",
+          "default": "auto",
+          "options": [
+            { "label": "Automatic (All Modes)", "value": "auto" },
+            { "label": "Trim & GIF Modes Only (Faster)", "value": "trim_only" },
+            { "label": "Manual (Click to Load)", "value": "manual" },
+            { "label": "Off (Metadata Only)", "value": "off" }
+          ]
+        },
+        {
+          "id": "timeline_filmstrip",
+          "kind": "toggle",
+          "label": "Timeline filmstrip thumbnails",
+          "description": "Generate video frame thumbnails along the Trim & Merge and GIF & Frames timeline bar in the background. Turn off for instant loading.",
+          "default": "true"
+        },
+        {
+          "id": "preview_proxy",
+          "kind": "select",
+          "label": "Non-native preview proxy",
+          "description": "How to preview formats the OS player cannot decode directly (MKV, WebM, AVI, VP9, AV1). Automatic builds proxies in the background; Fast Remux skips slow 480p transcodes.",
+          "default": "auto",
+          "options": [
+            { "label": "Automatic (Remux + 480p Transcode)", "value": "auto" },
+            { "label": "Fast Remux Only (Skip Slow Transcode)", "value": "remux_only" },
+            { "label": "Manual (Click to Build)", "value": "manual" },
+            { "label": "Off (Native Playback Only)", "value": "off" }
+          ]
+        },
+        {
+          "id": "hardware_accel",
+          "kind": "select",
+          "label": "Hardware acceleration",
+          "description": "Use your OS GPU decoder and encoder (VideoToolbox, D3D11VA/NVENC, QSV, AMF, VA-API) for faster filmstrips, proxies, and exports with automatic CPU fallback.",
+          "default": "auto",
+          "options": [
+            { "label": "Automatic (GPU Decode & Encode)", "value": "auto" },
+            { "label": "Hardware Decode Only (CPU Export)", "value": "decode_only" },
+            { "label": "Software CPU Only (Off)", "value": "off" }
+          ]
+        },
+        {
+          "id": "hardware_backend",
+          "kind": "select",
+          "label": "Hardware backend",
+          "description": "Choose which OS hardware acceleration backend FFmpeg Studio prefers when hardware acceleration is enabled.",
+          "default": "auto",
+          "options": [
+            { "label": "Auto-detect OS Best", "value": "auto" },
+            { "label": "Apple VideoToolbox (macOS)", "value": "videotoolbox" },
+            { "label": "Direct3D 11 (Windows D3D11VA)", "value": "d3d11va" },
+            { "label": "NVIDIA CUDA / NVENC", "value": "cuda" },
+            { "label": "Intel Quick Sync (QSV)", "value": "qsv" },
+            { "label": "AMD AMF", "value": "amf" },
+            { "label": "Linux VA-API", "value": "vaapi" }
+          ]
         }
       ],
       "history": {
