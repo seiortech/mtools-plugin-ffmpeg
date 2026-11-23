@@ -1,0 +1,19 @@
+{
+  "meta": {
+    "code": "id",
+    "name": "Bahasa Indonesia",
+    "author": "mtools Team"
+  },
+  "strings": {
+    "tools.ffmpeg.name": "Studio FFmpeg",
+    "fields.input_file.label": "Berkas Media Masukan",
+    "fields.output_dir.label": "Folder Keluaran",
+    "actions.transcode.label": "Konversi Media",
+    "actions.fetch_ffmpeg.label": "Unduh FFmpeg",
+    "actions.fetch_ffprobe.label": "Unduh FFprobe",
+    "helpers.ffmpeg.name": "ffmpeg",
+    "helpers.ffmpeg.description": "Mesin baris perintah wajib untuk konversi, pemangkasan, remux, dan ekstraksi frame video/audio.",
+    "helpers.ffprobe.name": "ffprobe",
+    "helpers.ffprobe.description": "Biner pendamping opsional untuk inspeksi stream JSON cepat (otomatis menggunakan ffmpeg -i jika tidak ada)."
+  }
+}

@@ -1,0 +1,132 @@
+{
+  "schema": 1,
+  "tools": [
+    {
+      "id": "ffmpeg",
+      "live": {
+        "initial_title": "FFmpeg Studio",
+        "mode": "tree",
+        "full_bleed": true
+      },
+      "fields": [
+        {
+          "id": "input_file",
+          "kind": "file",
+          "label": "Input Media File",
+          "required": false
+        },
+        {
+          "id": "output_dir",
+          "kind": "directory",
+          "label": "Output Folder",
+          "required": false
+        }
+      ],
+      "actions": [
+        {
+          "id": "transcode",
+          "label": "Transcode Media",
+          "kind": "run",
+          "inputs": ["input_file", "output_dir"]
+        },
+        {
+          "id": "fetch_ffmpeg",
+          "label": "Download FFmpeg",
+          "inputs": ["output_dir"]
+        },
+        {
+          "id": "fetch_ffprobe",
+          "label": "Download FFprobe",
+          "inputs": ["output_dir"]
+        }
+      ],
+      "helpers": [
+        {
+          "id": "ffmpeg",
+          "name": "ffmpeg",
+          "description": "Required command-line engine for video/audio conversion, trimming, remuxing, and frame extraction.",
+          "install_url": "https://ffmpeg.org/download.html",
+          "required": true
+        },
+        {
+          "id": "ffprobe",
+          "name": "ffprobe",
+          "description": "Optional companion binary for fast JSON stream inspection (falls back to ffmpeg -i automatically).",
+          "install_url": "https://ffmpeg.org/download.html",
+          "required": false
+        }
+      ],
+      "settings": [
+        {
+          "id": "ffmpeg_path",
+          "kind": "file",
+          "label": "ffmpeg executable path",
+          "description": "Custom ffmpeg path. Leave empty to use shared or auto-downloaded binary.",
+          "placeholder": "/usr/local/bin/ffmpeg",
+          "default": "",
+          "action": {
+            "id": "fetch_ffmpeg",
+            "label": "Download FFmpeg",
+            "description": "Download standalone ffmpeg binary to shared tools directory."
+          }
+        },
+        {
+          "id": "ffprobe_path",
+          "kind": "file",
+          "label": "ffprobe executable path",
+          "description": "Optional custom ffprobe path for fast JSON media probing.",
+          "placeholder": "/usr/local/bin/ffprobe",
+          "default": "",
+          "action": {
+            "id": "fetch_ffprobe",
+            "label": "Download FFprobe",
+            "description": "Download standalone ffprobe binary to shared tools directory."
+          }
+        },
+        {
+          "id": "output_dir",
+          "kind": "directory",
+          "label": "Default output folder",
+          "description": "Destination folder for finished media exports and snapshots.",
+          "default": "~/Downloads",
+          "required": true
+        },
+        {
+          "id": "default_container",
+          "kind": "select",
+          "label": "Default output container",
+          "description": "Initial container format selected when opening FFmpeg Studio.",
+          "default": "mp4",
+          "options": [
+            { "label": "MP4", "value": "mp4" },
+            { "label": "MKV", "value": "mkv" },
+            { "label": "WebM", "value": "webm" },
+            { "label": "MOV", "value": "mov" },
+            { "label": "MP3", "value": "mp3" },
+            { "label": "M4A", "value": "m4a" },
+            { "label": "FLAC", "value": "flac" },
+            { "label": "WAV", "value": "wav" }
+          ]
+        },
+        {
+          "id": "overwrite_policy",
+          "kind": "select",
+          "label": "Existing file policy",
+          "description": "How to handle collisions when an output file with the same name already exists.",
+          "default": "rename",
+          "options": [
+            { "label": "Auto-rename (file_1.mp4)", "value": "rename" },
+            { "label": "Overwrite existing", "value": "overwrite" }
+          ]
+        }
+      ],
+      "history": {
+        "title": "Transcode History",
+        "empty_title": "No exports yet",
+        "empty_subtitle": "Completed media exports will appear here.",
+        "show_hide": false,
+        "default_width": 320
+      }
+    }
+  ]
+}

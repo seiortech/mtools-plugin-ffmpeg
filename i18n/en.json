@@ -1,0 +1,19 @@
+{
+  "meta": {
+    "code": "en",
+    "name": "English",
+    "author": "mtools Team"
+  },
+  "strings": {
+    "tools.ffmpeg.name": "FFmpeg Studio",
+    "fields.input_file.label": "Input Media File",
+    "fields.output_dir.label": "Output Folder",
+    "actions.transcode.label": "Transcode Media",
+    "actions.fetch_ffmpeg.label": "Download FFmpeg",
+    "actions.fetch_ffprobe.label": "Download FFprobe",
+    "helpers.ffmpeg.name": "ffmpeg",
+    "helpers.ffmpeg.description": "Required command-line engine for video/audio conversion, trimming, remuxing, and frame extraction.",
+    "helpers.ffprobe.name": "ffprobe",
+    "helpers.ffprobe.description": "Optional companion binary for fast JSON stream inspection (falls back to ffmpeg -i automatically)."
+  }
+}
